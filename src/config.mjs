@@ -22,6 +22,7 @@ export const config = {
         raw: path.join(ROOT, 'data', 'raw'),
         state: path.join(ROOT, 'out', 'state.json'),
         report: path.join(ROOT, 'out', 'report.json'),
+        analysis: path.join(ROOT, 'out', 'analysis.json'),
     },
 };
 

@@ -97,10 +97,12 @@ export async function syncTroops(session, { keepRaw = false } = {}) {
     let fresh = 0;
     let hidden = 0;
 
+    let crew = null;
     for (const cat of CATEGORIES) {
         const html = await session.view('units', { cat });
         if (keepRaw) await writeText(path.join(config.paths.raw, `view-units-${cat}.html`), html);
 
+        if (cat === 'troops') crew = readCrew(html);
         const cards = parseCards(html, cat);
         seen[cat] = cards.length;
         for (const card of cards) {
@@ -126,6 +128,15 @@ export async function syncTroops(session, { keepRaw = false } = {}) {
     store.accountLevel = session.boot?.player?.level?.level ?? null;
     store.gameLocale = session.boot?.locale || null;
     store.counts = seen;
+    // Places de troupes et emplacements de types : le simulateur de compos en a besoin, et le
+    // seuil d'activation des capacités (10 % des places) en découle directement.
+    store.crew = {
+        ...(crew || {}),
+        ...(session.boot?.player?.crew?.troops
+            ? { inService: session.boot.player.crew.troops.n, reserve: session.boot.player.crew.troops.reserve || 0 }
+            : {}),
+    };
+    store.crew.abilityNeed = store.crew.slots ? Math.ceil(store.crew.slots * 0.1) : null;
     await writeJson(config.paths.troops, store);
     log.pass(`${Object.keys(store.units).length} unités en base → ${rel(config.paths.troops)}`);
 
@@ -138,6 +149,17 @@ export async function syncTroops(session, { keepRaw = false } = {}) {
             + 'commande en montant de niveau, le fichier se complète tout seul.');
     }
     return { file, units: Object.keys(store.units).length, fresh, hidden };
+}
+
+/* L'en-tête de la vue porte les deux limites qui encadrent une composition :
+   « Room: 875 / 875 » (places de troupes) et « Types: 4 / 4 » (emplacements de types). */
+function readCrew(html) {
+    const head = grab(html, /<div class="sheet-head">([\s\S]*?)<\/div>\s*<div/) || html;
+    const nums = [...text(head).matchAll(/(\d[\d\s.,]*)\s*\/\s*(\d[\d\s.,]*)/g)]
+        .map((m) => [num(m[1]), num(m[2])]);
+    const [used, slots] = nums[0] || [null, null];
+    const [typesUsed, typeSlots] = nums[1] || [null, null];
+    return { used, slots, typesUsed, typeSlots };
 }
 
 /* ---------- Lecture d'une carte ---------- */

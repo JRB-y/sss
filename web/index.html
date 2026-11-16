@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSS — Poste de commandement</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@500;700;900&family=Archivo:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body data-palette="#ca7a00,#00a87e,#fe0036,#a200fe">
+<div class="grain" aria-hidden="true"></div>
+<div class="lamp" aria-hidden="true"></div>
+
+<div class="app">
+  <aside class="rail">
+    <a class="brand" href="#tableau">
+      <span class="brand-mark" aria-hidden="true">SSS</span>
+      <span class="brand-text">
+        <strong>Poste de<br>commandement</strong>
+        <em>Sea Sex and Sun</em>
+      </span>
+    </a>
+
+    <nav class="nav" aria-label="Sections">
+      <a href="#tableau" data-view="tableau"><i class="dot"></i>Tableau de bord</a>
+      <a href="#regles" data-view="regles"><i class="dot"></i>Les règles</a>
+      <a href="#troupes" data-view="troupes"><i class="dot"></i>Les troupes</a>
+      <a href="#analyse" data-view="analyse"><i class="dot"></i>Analyse des combats</a>
+      <a href="#compos" data-view="compos"><i class="dot"></i>Compositions</a>
+    </nav>
+
+    <div class="rail-foot">
+      <dl class="rail-stats" id="rail-stats"></dl>
+      <button class="console-toggle" type="button" data-console-toggle aria-expanded="false">
+        <span class="led" data-led></span> Journal
+      </button>
+    </div>
+  </aside>
+
+  <main class="stage" id="stage">
+    <div class="view" id="view-tableau" hidden>
+      <header class="view-head">
+        <p class="kicker">État des lieux</p>
+        <h1>Tableau de bord</h1>
+        <p class="lede">Tout part d’ici : récupérer les combats que le jeu expose encore, les analyser,
+          puis chercher la composition qui gagne plus souvent qu’elle ne perd.</p>
+      </header>
+
+      <section class="actions" aria-label="Actions">
+        <button class="act act-primary" data-action="fetch-fights">
+          <span class="act-no">01</span>
+          <span class="act-body"><strong>Récupérer les combats</strong>
+            <em>Se connecte au jeu et télécharge ceux qui manquent en base</em></span>
+        </button>
+        <button class="act" data-action="analyse">
+          <span class="act-no">02</span>
+          <span class="act-body"><strong>Analyser</strong>
+            <em>Bilan, rendement par type, capacités gaspillées, vivier adverse</em></span>
+        </button>
+        <button class="act" data-action="compos">
+          <span class="act-no">03</span>
+          <span class="act-body"><strong>Proposer une composition</strong>
+            <em>Cherche la compo qui gagne le plus contre les adversaires déjà rencontrés</em></span>
+        </button>
+      </section>
+
+      <section class="actions actions-minor" aria-label="Mises à jour">
+        <button class="act act-small" data-action="fetch-troops">
+          <span class="act-body"><strong>Relever les troupes</strong><em>Stats, capacités et coûts depuis le shop</em></span>
+        </button>
+        <button class="act act-small" data-action="fetch-rules">
+          <span class="act-body"><strong>Régénérer les règles</strong><em>Reconvertit la page officielle en Markdown</em></span>
+        </button>
+        <button class="act act-small" data-action="fetch-fights-refresh">
+          <span class="act-body"><strong>Tout retélécharger</strong><em>Reprend le détail de chaque combat</em></span>
+        </button>
+      </section>
+
+      <div id="dash-summary"></div>
+    </div>
+
+    <div class="view doc-view" id="view-regles" hidden>
+      <div class="doc-shell">
+        <aside class="doc-toc" aria-label="Sommaire"><div class="toc-inner"></div></aside>
+        <article class="doc prose"></article>
+      </div>
+    </div>
+
+    <div class="view doc-view" id="view-troupes" hidden>
+      <div class="doc-shell">
+        <aside class="doc-toc" aria-label="Sommaire"><div class="toc-inner"></div></aside>
+        <article class="doc prose"></article>
+      </div>
+    </div>
+
+    <div class="view" id="view-analyse" hidden>
+      <header class="view-head">
+        <p class="kicker">Mesuré, pas estimé</p>
+        <h1>Analyse des combats</h1>
+        <p class="lede">Chiffres lus dans les rapports de combat du jeu : rien n’est extrapolé ici.</p>
+      </header>
+      <div id="analyse-body"><p class="empty">Clique sur <strong>Analyser</strong> depuis le tableau de bord.</p></div>
+    </div>
+
+    <div class="view" id="view-compos" hidden>
+      <header class="view-head">
+        <p class="kicker">Simulation</p>
+        <h1>Compositions</h1>
+        <p class="lede">Chaque composition est jouée contre tous les adversaires de ton historique,
+          avec tes fortifications et l’état réel de tes troupes.</p>
+      </header>
+      <div id="compos-body"><p class="empty">Clique sur <strong>Proposer une composition</strong> depuis le tableau de bord.</p></div>
+    </div>
+  </main>
+</div>
+
+<section class="console" data-console aria-label="Journal" hidden>
+  <header class="console-head">
+    <span class="console-title"><span class="led" data-led></span> Journal</span>
+    <span class="console-task" data-console-task></span>
+    <button type="button" data-console-close aria-label="Fermer le journal">✕</button>
+  </header>
+  <ol class="console-lines" data-console-lines></ol>
+</section>
+
+<div class="toast-stack" data-toasts aria-live="polite"></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>
