@@ -15,8 +15,10 @@ export const config = {
     timeoutMs: Number(process.env.SSS_TIMEOUT_MS || 45000),
     paths: {
         data: path.join(ROOT, 'data'),
+        docs: path.join(ROOT, 'docs'),
         out: path.join(ROOT, 'out'),
         fights: path.join(ROOT, 'data', 'fights.json'),
+        troops: path.join(ROOT, 'data', 'troops.json'),
         raw: path.join(ROOT, 'data', 'raw'),
         state: path.join(ROOT, 'out', 'state.json'),
         report: path.join(ROOT, 'out', 'report.json'),

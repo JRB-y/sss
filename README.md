@@ -1,7 +1,8 @@
 # sss-play-check
 
 Script Playwright qui se connecte à un compte **ssandsun.com/play**, vérifie quelques points de
-santé et exporte l'historique de combats en JSON, de façon incrémentale.
+santé, exporte l'historique de combats en JSON et tient à jour une documentation du jeu
+(règles officielles et fiches de troupes) en Markdown — tout de façon incrémentale.
 
 ## Installation
 
@@ -18,6 +19,8 @@ cp .env.example .env        # puis renseigne SSS_EMAIL / SSS_PASSWORD
 npm run check      # connexion + vérifications → out/report.json + out/game.png
 npm run fights     # télécharge les combats absents → data/fights.json
 npm run all        # les deux
+npm run rules      # règles officielles du site → docs/regles.md (sans connexion)
+npm run troops     # fiches des troupes relevées en jeu → data/troops.json + docs/troupes.md
 npm run explore    # dépose les réponses brutes du jeu dans data/raw/ (debug)
 ```
 
@@ -28,6 +31,7 @@ npm run fights -- --refresh     # retélécharge le détail de TOUS les combats
 npm run check  -- --headed      # navigateur visible
 npm run fights -- --fresh       # ignore la session enregistrée, rejoue le formulaire
 npm run fights -- --raw         # garde le HTML des listes dans data/raw/
+npm run rules  -- --locale=en   # autre langue : fr (défaut), en, es, de, it
 ```
 
 Code de sortie : `0` si tout passe, `1` si un check échoue ou si un combat n'a pas pu être
@@ -110,6 +114,38 @@ Le script utilise l'API interne du jeu plutôt que de scraper l'écran :
 Index par id : la fusion est idempotente et l'écriture atomique (un run interrompu ne laisse pas
 de fichier tronqué).
 
+## Documentation du jeu (`docs/`)
+
+Deux documents générés, pas écrits à la main : relance la commande pour les rafraîchir.
+
+### `docs/regles.md` — les règles officielles (`npm run rules`)
+
+Conversion en Markdown de <https://ssandsun.com/fr/regles> : 13 chapitres, 56 sections, tableaux
+et encadrés compris. La page est rendue côté serveur, donc **aucune connexion n'est nécessaire** —
+un simple `fetch`. Le balisage est régulier (`section.r-chapter` › `article.r-section` ›
+`p | ul.r-list | ol.r-steps | table.r-table | div.r-facts | p.r-note`), il est traduit bloc par
+bloc pour ne rien perdre des tableaux. `--locale=` choisit la langue (`fr`, `en`, `es`, `de`, `it`).
+
+### `docs/troupes.md` — les 21 types de troupes (`npm run troops`)
+
+Relevé dans le jeu via `GET /play/view/units?cat=<troops|girls|narcos>`. Chaque carte
+(`li.unit-card`) porte le rôle, la capacité spéciale et son texte complet, les stats **de base**
+(le type seul) **et effectives** (tes talents + ton équipement), le niveau de type et le coût au
+recrutement. Les filles et les narcos passent par la même vue (production par tour, risque
+d'arrestation).
+
+> **Ce que le serveur ne donne pas.** Les types au-dessus de ton niveau de personnage sont servis
+> masqués (`is-secret`) : ni stats, ni capacité. Seul le **prochain** à débloquer est montré en
+> avant-première. Aucune autre vue du jeu ne les expose (vérifié sur une quarantaine de vues, les
+> rapports de combat et le bundle `app.js`). `data/troops.json` **accumule** donc, comme
+> `data/fights.json` : relancer la commande en montant de niveau complète le document, et une
+> carte masquée n'écrase jamais un relevé déjà fait. Niveaux de déblocage et rôles des types encore
+> verrouillés viennent des règles publiques, les noms français aussi.
+
+> **Langue.** L'interface du jeu suit le réglage du compte (`boot.locale`) ; ni `Accept-Language`
+> ni un paramètre d'URL ne la changent. Les noms d'unité, descriptions et libellés sont donc relevés
+> dans cette langue — le document le signale et complète avec les noms et effets français des règles.
+
 ## Réglages (`.env`)
 
 | Variable | Défaut | Rôle |
@@ -130,6 +166,9 @@ src/config.mjs    lecture de l'environnement, chemins
 src/client.mjs    Chromium, connexion, helpers d'API (view/json), collecte console+réseau
 src/checks.mjs    les points vérifiés + rapport
 src/fights.mjs    listes → détails → fusion incrémentale
+src/troops.mjs    cartes du shop → data/troops.json + docs/troupes.md
+src/rules.mjs     règles publiques → docs/regles.md (sans navigateur)
 src/explore.mjs   dump des réponses brutes (debug)
 src/index.mjs     CLI
+docs/             documents générés (versionnés)
 ```
