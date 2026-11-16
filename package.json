@@ -1,0 +1,17 @@
+{
+  "name": "sss-play-check",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Checks de santé du compte ssandsun.com/play + export incrémental de l'historique de combats (Playwright)",
+  "scripts": {
+    "check": "node --env-file-if-exists=.env src/index.mjs check",
+    "fights": "node --env-file-if-exists=.env src/index.mjs fights",
+    "explore": "node --env-file-if-exists=.env src/index.mjs explore",
+    "all": "node --env-file-if-exists=.env src/index.mjs check fights",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.65.1"
+  }
+}

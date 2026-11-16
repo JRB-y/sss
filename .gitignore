@@ -1,0 +1,7 @@
+node_modules/
+.env
+# session réutilisée entre les runs : contient des cookies d'authentification
+out/state.json
+out/*.png
+out/report.json
+data/
