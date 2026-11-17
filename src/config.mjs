@@ -22,6 +22,7 @@ export const config = {
         enemies: path.join(ROOT, 'data', 'enemies.json'),
         items: path.join(ROOT, 'data', 'items.json'),
         skills: path.join(ROOT, 'data', 'skills.json'),
+        hq: path.join(ROOT, 'data', 'hq.json'),
         assets: path.join(ROOT, 'data', 'assets'),
         assetsManifest: path.join(ROOT, 'data', 'assets', 'manifest.json'),
         raw: path.join(ROOT, 'data', 'raw'),

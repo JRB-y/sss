@@ -1,5 +1,6 @@
 import { config } from './config.mjs';
 import { log, readJson, writeJson, writeText, sleep } from './util.mjs';
+import { parseFightLog, nameMap, LOG_VERSION } from './fightlog.mjs';
 
 /* Export de l'historique de combats.
 
@@ -16,7 +17,10 @@ import { log, readJson, writeJson, writeText, sleep } from './util.mjs';
    la fenêtre. Un run ne retélécharge que les ids absents (ou tous avec --refresh), si bien que
    relancer régulièrement la commande constitue l'archive complète au fil du temps. */
 
-const STORE_VERSION = 2;
+const STORE_VERSION = 3;
+/* Journaux rattrapés par passage : les combats déjà en base n'en ont pas, et on ne va pas
+   enchaîner des centaines de requêtes d'un coup. Le retard se résorbe en quelques passages. */
+const LOG_BACKFILL = 40;
 const FALLBACK_DIRS = ['sent', 'received'];
 /** Nombre de runs gardés dans le journal : assez pour voir une dérive, pas de quoi gonfler le fichier. */
 const RUN_LOG = 50;
@@ -122,6 +126,11 @@ export async function syncFights(session, { refresh = false, keepRaw = false, pr
         await sleep(config.requestDelayMs);
     }
 
+    /* Le journal rédigé par le jeu, en plus du rapport JSON : lui seul dit quels coups ont été
+       critiques et combien d'unités chaque coup a mises KO. Les combats déjà en base n'en ont pas
+       encore — on en rattrape un lot par passage plutôt que tout d'un coup. */
+    const logs = await fetchLogs(session, store, { refresh });
+
     // Les combats déjà connus gardent leur détail, mais on rafraîchit leur appartenance aux listes.
     for (const entry of listed.values()) {
         const stored = store.fights[entry.id];
@@ -143,6 +152,7 @@ export async function syncFights(session, { refresh = false, keepRaw = false, pr
         window: windows,
         listed: listed.size,
         downloaded: ok,
+        logs,
         failed,
         knownBefore,
         total: Object.keys(store.fights).length,
@@ -153,6 +163,9 @@ export async function syncFights(session, { refresh = false, keepRaw = false, pr
 
     const total = Object.keys(store.fights).length;
     log.pass(`${ok} combat(s) téléchargé(s), ${failed} en échec`);
+    if (logs.fetched || logs.missing) {
+        log.pass(`journaux : ${logs.fetched} récupéré(s)${logs.missing ? `, ${logs.missing} encore à rattraper` : ', tous à jour'}`);
+    }
     log.pass(`${total} combat(s) en base (+${total - knownBefore} depuis le dernier run) → ${rel(config.paths.fights)}`);
     log.dim(`répartition : ${store.counts.sent} envoyé(s) · ${store.counts.received} reçu(s)`
         + ` · dernier combat le ${store.counts.lastFightAt ? new Date(store.counts.lastFightAt * 1000).toLocaleString('fr-FR') : '?'}`);
@@ -171,7 +184,36 @@ export async function syncFights(session, { refresh = false, keepRaw = false, pr
         }
     }
 
-    return { listed: listed.size, downloaded: ok, failed, total, holes, window: windows, projected, store };
+    return { listed: listed.size, downloaded: ok, logs, failed, total, holes, window: windows, projected, store };
+}
+
+/* Récupère les journaux manquants, du plus récent au plus ancien : ce sont ceux qu'on consulte. */
+async function fetchLogs(session, store, { refresh = false } = {}) {
+    const pending = Object.values(store.fights)
+        .filter((f) => f.detail?.fight?.report && (refresh || f.log?.version !== LOG_VERSION))
+        .sort((a, b) => (b.detail.fight.report.at || 0) - (a.detail.fight.report.at || 0));
+
+    const batch = pending.slice(0, LOG_BACKFILL);
+    let fetched = 0;
+    let failed = 0;
+    for (const [i, entry] of batch.entries()) {
+        try {
+            const html = await session.view('fightlog', { id: entry.id });
+            const parsed = parseFightLog(html, nameMap(entry.detail.fight.report));
+            if (parsed) {
+                entry.log = { ...parsed, fetchedAt: new Date().toISOString() };
+                fetched += 1;
+            } else {
+                failed += 1;
+            }
+        } catch (e) {
+            failed += 1;
+            log.warn(`journal ${entry.id} : ${e.message}`);
+        }
+        if ((i + 1) % 10 === 0 || i + 1 === batch.length) log.dim(`journaux : ${i + 1}/${batch.length}`);
+        await sleep(Math.max(config.requestDelayMs, 250));
+    }
+    return { fetched, failed, missing: Math.max(0, pending.length - batch.length) };
 }
 
 /** Onglets de la vue : on lit les directions proposées par le serveur plutôt que de les deviner. */

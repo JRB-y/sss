@@ -99,7 +99,7 @@ export async function syncTroops(session, { keepRaw = false } = {}) {
 
     let crew = null;
     for (const cat of CATEGORIES) {
-        const html = await session.view('units', { cat });
+        const html = await viewWithBackoff(session, 'units', { cat });
         if (keepRaw) await writeText(path.join(config.paths.raw, `view-units-${cat}.html`), html);
 
         if (cat === 'troops') crew = readCrew(html);
@@ -120,7 +120,7 @@ export async function syncTroops(session, { keepRaw = false } = {}) {
             };
         }
         log.info(`${cat} : ${cards.length} cartes, ${cards.filter((c) => !c.detailed).length} sans stats`);
-        await sleep(Math.max(config.requestDelayMs, 400)); // 5 vues trop rapprochées → HTTP 409
+        await sleep(Math.max(config.requestDelayMs, 400));
     }
 
     store.updatedAt = now;
@@ -149,6 +149,27 @@ export async function syncTroops(session, { keepRaw = false } = {}) {
             + 'commande en montant de niveau, le fichier se complète tout seul.');
     }
     return { file, units: Object.keys(store.units).length, fresh, hidden };
+}
+
+/* Le serveur refuse les vues trop rapprochées (HTTP 409). Ça n'a rien d'une panne : on patiente
+   et on recommence, au lieu de faire échouer tout le relevé — et donc la régénération du document
+   qui en dépend. */
+async function viewWithBackoff(session, name, params) {
+    const waits = [0, 1500, 4000, 9000];
+    let last = null;
+    for (const [i, wait] of waits.entries()) {
+        if (wait) {
+            log.dim(`vue « ${name} » refusée (trop rapprochée) : nouvelle tentative dans ${wait / 1000} s`);
+            await sleep(wait);
+        }
+        try {
+            return await session.view(name, params);
+        } catch (e) {
+            if (!/\b409\b/.test(e.message) || i === waits.length - 1) throw e;
+            last = e;
+        }
+    }
+    throw last;
 }
 
 /* L'en-tête de la vue porte les deux limites qui encadrent une composition :
@@ -396,6 +417,8 @@ function renderTroopsDoc(store) {
     if (!known.length) out.push('*Aucune carte chiffrée pour ce compte.*', '');
     for (const { r, u } of known) {
         out.push(`### ${r.fr}${u.name && u.name !== r.fr ? ` · *${u.name}*` : ''}`, '');
+        // Le portrait copié en local par `npm run assets` ; absent, l'interface le retire d'elle-même.
+        out.push(`![${r.fr}](/assets/units/${r.key}.webp)`, '');
         out.push(`**Niveau requis** ${r.level} · **Rôle** ${ROLE_FR[u.role?.key || r.role]}`
             + ` · **Capacité** ${u.ability?.fr || u.ability?.name || '—'}`
             + ` · **Niveau de type** ${u.typeLevel ?? '—'}${u.owned ? ` · **Possédées** ${u.owned}` : ''}`, '');

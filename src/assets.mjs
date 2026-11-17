@@ -100,6 +100,17 @@ async function collectTargets() {
         add(u.image, `units/${name}`, 'portrait');
     }
 
+    /* Bâtiments et ressources : les sprites dépendent du niveau (`gym-2`), donc on prend ceux
+       posés dans la ville plus le niveau 1 de chaque type, pour avoir toujours une image. */
+    const hq = await readJson(config.paths.hq);
+    for (const b of hq?.buildings || []) {
+        add(`/assets/images/buildings/${b.sprite}.webp`, `buildings/${b.sprite}.webp`, 'bâtiment');
+        add(`/assets/images/buildings/${b.type}.webp`, `buildings/${b.type}.webp`, 'bâtiment');
+    }
+    for (const r of hq?.resources || []) {
+        add(`/assets/images/res/${r.icon}.webp`, `res/${r.icon}.webp`, 'ressource');
+    }
+
     // Les avatars de tous les joueurs croisés, moi compris.
     const enemies = await readJson(config.paths.enemies);
     for (const p of Object.values(enemies?.players || {})) {

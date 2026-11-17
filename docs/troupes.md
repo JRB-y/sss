@@ -86,6 +86,8 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 ### Junkie
 
+![Junkie](/assets/units/mauviette.webp)
+
 **Niveau requis** 1 · **Rôle** Rapide · **Capacité** Embuscade · **Niveau de type** 3
 
 *Progression du type : 7 911 / 27 134 XP (29,2 %) avant le niveau 4 — il reste 19 223 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
@@ -106,9 +108,11 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 ### Racaille · *Scumbag*
 
-**Niveau requis** 1 · **Rôle** Défenseur · **Capacité** Bouclier · **Niveau de type** 3 · **Possédées** 30
+![Racaille](/assets/units/racaille.webp)
 
-*Progression du type : 11 972 / 27 134 XP (44,1 %) avant le niveau 4 — il reste 15 162 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+**Niveau requis** 1 · **Rôle** Défenseur · **Capacité** Bouclier · **Niveau de type** 3 · **Possédées** 113
+
+*Progression du type : 13 813 / 27 134 XP (50,9 %) avant le niveau 4 — il reste 13 321 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *The punk doesn’t look like much, but knows exactly where it hurts.*
 
@@ -116,19 +120,21 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
-| Vie | 3 224 | 3 837 |
-| Dégâts | 239 – 260 | 466 – 497 |
-| Critique | 5 % | 12 % |
-| Riposte | 55 % | 71 % |
-| Vitesse d’attaque | 1 coup / 1,5 s | 1 coup / 1,58 s |
+| Vie | 3 224 | 3 563 |
+| Dégâts | 239 – 260 | 428 – 457 |
+| Critique | 5 % | 13 % |
+| Riposte | 55 % | 56,5 % |
+| Vitesse d’attaque | 1 coup / 1,5 s | 1 coup / 1,3 s |
 
 **Coût d’un recrutement** — 50 $ · 30 alcool · 30 herbe · 15 poudre
 
 ### Lascar · *Hustler*
 
-**Niveau requis** 1 · **Rôle** Cogneur · **Capacité** Rage · **Niveau de type** 4 · **Possédées** 641
+![Lascar](/assets/units/lascar.webp)
 
-*Progression du type : 35 918 / 47 891 XP (75 %) avant le niveau 5 — il reste 11 973 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+**Niveau requis** 1 · **Rôle** Cogneur · **Capacité** Rage · **Niveau de type** 4 · **Possédées** 151
+
+*Progression du type : 39 175 / 47 891 XP (81,8 %) avant le niveau 5 — il reste 8 716 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *He didn’t invent sliced bread, but he hits hard. That’s it.*
 
@@ -145,6 +151,8 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 **Coût d’un recrutement** — 50 $ · 20 alcool · 5 herbe · 40 poudre
 
 ### Voyou · *Thug*
+
+![Voyou](/assets/units/voyou.webp)
 
 **Niveau requis** 5 · **Rôle** Rapide · **Capacité** Frénésie · **Niveau de type** 1
 
@@ -166,9 +174,11 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 ### Bandit
 
-**Niveau requis** 10 · **Rôle** Défenseur · **Capacité** Second souffle · **Niveau de type** 3 · **Possédées** 118
+![Bandit](/assets/units/bandit.webp)
 
-*Progression du type : 3 729 / 27 134 XP (13,7 %) avant le niveau 4 — il reste 23 405 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+**Niveau requis** 10 · **Rôle** Défenseur · **Capacité** Second souffle · **Niveau de type** 3 · **Possédées** 543
+
+*Progression du type : 8 147 / 27 134 XP (30 %) avant le niveau 4 — il reste 18 987 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *Sly and effective, the bandit is ready to serve at any moment.*
 
@@ -177,18 +187,20 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
 | Vie | 3 359 | 4 048 |
-| Dégâts | 249 – 270 | 441 – 471 |
-| Critique | 5 % | 18,5 % |
+| Dégâts | 249 – 270 | 480 – 513 |
+| Critique | 5 % | 19,5 % |
 | Riposte | 55 % | 57,5 % |
-| Vitesse d’attaque | 1 coup / 1,5 s | 1 coup / 1,3 s |
+| Vitesse d’attaque | 1 coup / 1,5 s | 1 coup / 1,46 s |
 
 **Coût d’un recrutement** — 90 $ · 45 alcool · 50 herbe · 40 poudre
 
 ### Brute
 
-**Niveau requis** 15 · **Rôle** Cogneur · **Capacité** Onde de choc · **Niveau de type** 2 · **Possédées** 86
+![Brute](/assets/units/brute.webp)
 
-*Progression du type : 2 332 / 11 546 XP (20,2 %) avant le niveau 3 — il reste 9 214 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+**Niveau requis** 15 · **Rôle** Cogneur · **Capacité** Onde de choc · **Niveau de type** 2 · **Possédées** 108
+
+*Progression du type : 7 275 / 11 546 XP (63 %) avant le niveau 3 — il reste 4 271 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *Beneath that shell of muscle lies a sensitive soul. Or not.*
 
@@ -205,6 +217,8 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 **Coût d’un recrutement** — 110 $ · 70 alcool · 40 herbe · 55 poudre
 
 ### Diablesse · *She-devil*
+
+![Diablesse](/assets/units/diablesse.webp)
 
 **Niveau requis** 20 · **Rôle** Rapide · **Capacité** — · **Niveau de type** 1
 

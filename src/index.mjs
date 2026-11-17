@@ -5,6 +5,7 @@ import { syncFights } from './fights.mjs';
 import { explore } from './explore.mjs';
 import { syncTroops } from './troops.mjs';
 import { syncSkills } from './skills.mjs';
+import { syncHq } from './hq.mjs';
 import { exportRules } from './rules.mjs';
 import { serve } from './server.mjs';
 import { log } from './util.mjs';
@@ -22,7 +23,9 @@ Commandes
   rules      convertit les règles publiques du site en Markdown → docs/regles.md
   troops     relève les stats des 21 types de troupes → data/troops.json + docs/troupes.md
   skills     relève ton arbre de talents → data/skills.json (il sépare talents et équipement)
+  hq         relève ton QG : ressources, bâtiments, niveau, points de compétence → data/hq.json
   assets     télécharge les images du jeu (troupes, objets, avatars) → data/assets/ (sans connexion)
+  report     compte rendu Markdown complet pour un agent IA → docs/rapport.md (sans connexion)
   analyse    analyse l'historique de combats dans le terminal → out/analysis.json
   ui         ouvre l'interface locale (docs, analyse, compositions) sur http://127.0.0.1:4173
 
@@ -47,7 +50,7 @@ if (flags.has('--help') || flags.has('-h') || commands.length === 0) {
 }
 if (flags.has('--headed')) config.headed = true;
 
-const known = new Set(['check', 'fights', 'enemies', 'assets', 'explore', 'rules', 'troops', 'skills', 'analyse', 'ui']);
+const known = new Set(['check', 'fights', 'enemies', 'assets', 'explore', 'rules', 'troops', 'skills', 'hq', 'report', 'analyse', 'ui']);
 const unknown = commands.filter((c) => !known.has(c));
 if (unknown.length) {
     console.error(`Commande inconnue : ${unknown.join(', ')}\n\n${USAGE}`);
@@ -93,6 +96,24 @@ if (commands.includes('assets')) {
     }
 }
 
+/* `report` agrège tout ce qui est en base en un seul document : pas de réseau non plus. */
+if (commands.includes('report')) {
+    try {
+        const { buildReport } = await import('./report.mjs');
+        const { writeText } = await import('./util.mjs');
+        const md = await buildReport();
+        const file = `${config.paths.docs}/rapport.md`;
+        await writeText(file, md);
+        log.title('Compte rendu');
+        log.pass(`${md.split('\n').length} lignes → ${file.replace(`${config.root}/`, '')}`);
+        log.dim('à coller dans une conversation avec un agent IA pour lui demander conseil.');
+    } catch (e) {
+        log.fail(e.message);
+        if (process.env.SSS_DEBUG === '1') console.error(e);
+        exitCode = 1;
+    }
+}
+
 // `analyse` ne lit que les fichiers de données : pas de navigateur non plus.
 if (commands.includes('analyse')) {
     try {
@@ -111,7 +132,7 @@ if (commands.includes('ui')) {
     await new Promise(() => {}); // le serveur tourne jusqu'au Ctrl+C
 }
 
-const needsGame = commands.some((c) => !['rules', 'analyse', 'enemies', 'assets', 'ui'].includes(c));
+const needsGame = commands.some((c) => !['rules', 'analyse', 'enemies', 'assets', 'report', 'ui'].includes(c));
 if (!needsGame) process.exit(exitCode);
 
 const session = await GameSession.open({ fresh: flags.has('--fresh') });
@@ -142,6 +163,7 @@ try {
         }
         if (command === 'troops') await syncTroops(session, { keepRaw: flags.has('--raw') });
         if (command === 'skills') await syncSkills(session, { keepRaw: flags.has('--raw') });
+        if (command === 'hq') await syncHq(session);
         if (command === 'explore') await explore(session);
     }
 } catch (e) {

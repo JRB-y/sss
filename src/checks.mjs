@@ -46,10 +46,15 @@ export async function runChecks(session) {
     add('Au moins une ville', Array.isArray(session.boot.cities) && session.boot.cities.length > 0,
         `${(session.boot.cities || []).length} ville(s)`);
 
-    // Les éléments du cadre de jeu n'existent qu'après le passage en état 'game'.
+    // Les éléments du cadre de jeu n'existent qu'après le passage en état 'game' — et la carte
+    // MapLibre monte quelques secondes APRÈS le boot : on attend chaque sélecteur au lieu de
+    // photographier l'instant, sinon le check échoue sur une simple course au chargement.
     for (const check of PAGE_CHECKS) {
         if (check.selector) {
-            const count = await session.page.locator(check.selector).count();
+            const found = await session.page.locator(check.selector).first()
+                .waitFor({ state: 'attached', timeout: 10000 })
+                .then(() => true, () => false);
+            const count = found ? await session.page.locator(check.selector).count() : 0;
             add(check.label, count > 0, count > 0 ? `${count} élément(s)` : `introuvable : ${check.selector}`);
         } else if (check.text) {
             const visible = await session.page.getByText(check.text, { exact: false }).count();

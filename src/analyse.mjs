@@ -98,10 +98,20 @@ function readFight(id, entry, report, meId) {
     const sideIdx = mine === 'att' ? 0 : 1;
     const cs = report.result?.cs || 0;
 
+    /* Le tirage de dégâts PROPRE de chaque pile, mesuré dans le journal : médiane de
+       dégâts ÷ unités vivantes sur les coups normaux (ni critique, ni riposte, ni embuscade,
+       ni pendant une rage, ni absorbé par un bouclier). C'est la mesure la plus directe de la
+       puissance réelle d'une pile — elle expose les talents adverses que les PV ne montrent pas. */
+    const cleanRolls = measureCleanRolls(entry.log);
+
     // Dégâts subis par pile : les coups reçus plus les ripostes rendues en frappant.
     const taken = { att: {}, def: {} };
     const hits = { att: {}, def: {} };
     const dpu = { att: {}, def: {} }; // dégâts par unité vivante, coup par coup
+    const hitTimes = { att: {}, def: {} }; // horodatages des coups, pour l'intervalle exact
+    for (const [t, side, from] of report.events || []) {
+        (hitTimes[side === 0 ? 'att' : 'def'][from] ||= []).push(t);
+    }
     for (const [, side, from, to, dmg, alive, counter] of report.events || []) {
         const me = side === 0 ? 'att' : 'def';
         const foe = side === 0 ? 'def' : 'att';
@@ -123,7 +133,10 @@ function readFight(id, entry, report, meId) {
             owner: p.owner || null,
             qty: p.qty,
             unitHp: p.unitHp,
+            // `hp` = PV au départ du combat (une pile en défense n'a pas fini de récupérer),
+            // `end` = PV à la fin. Les confondre fait afficher « 100 % restants » sur une défaite.
             hp: p.hp,
+            end: p.end ?? null,
             max: p.max,
             typeLevel: p.level,
             role: p.role,
@@ -132,9 +145,18 @@ function readFight(id, entry, report, meId) {
             taken: taken[side][p.key] || 0,
             hits: nHits,
             dpuPerHit: median(dpu[side][p.key] || []),
+            // Mesures du journal (net du fort adverse) : tirage normal médian, taux et
+            // multiplicateur de critique, taux de riposte. Null sans journal.
+            rollMedian: cleanRolls?.[side === 'att' ? 0 : 1]?.get(p.key.replace(/@.*/, ''))?.roll ?? null,
+            logStats: cleanRolls?.[side === 'att' ? 0 : 1]?.get(p.key.replace(/@.*/, '')) ?? null,
             // Cadence mesurée : durée du combat ÷ coups portés. Approchée si la pile tombe tôt,
             // donc on exige quelques coups avant de la publier.
             interval: nHits >= 3 && cs ? cs / nHits / 100 : null,
+            /* L'intervalle EXACT, en centièmes de seconde : une pile frappe à intervalle
+               constant `round(vitesse × 100)` (mesuré sur toutes les frises — seules la frénésie
+               et le dernier carré le divisent, temporairement). On prend le mode des derniers
+               écarts entre coups : c'est la cadence de croisière, hors accélérations. */
+            intervalCs: stableInterval(hitTimes[side][p.key] || []),
             gear: gear.map((g) => ({
                 slot: g.slot, slotFr: g.slotFr, item: g.item, name: g.name,
                 rarity: g.rarity, rarityFr: g.rarityFr, affixes: g.affixes, bonuses: g.labels,
@@ -197,6 +219,69 @@ function ratingDelta(rating, mine) {
 function payloadTotal(payload) {
     if (payload && typeof payload === 'object') return Object.values(payload).reduce((a, b) => a + b, 0);
     return typeof payload === 'number' ? payload : 0;
+}
+
+/* Mesures par pile, lues dans le journal rédigé par le jeu :
+   — le tirage normal médian (coups « propres » : ni riposte, ni critique, ni t = 0, ni dégâts
+     nuls — bouclier —, ni dans les 10 s qui suivent une Rage du camp) : la puissance réelle,
+     talents adverses compris, × (1 − fort adverse) ;
+   — le taux de critique observé (crits ÷ coups portés) ;
+   — le multiplicateur de critique observé (médiane des tirages critiques ÷ normaux) ;
+   — le taux de riposte observé (ripostes rendues ÷ coups reçus). */
+function measureCleanRolls(log) {
+    if (!log?.lines) return null;
+    const rageUntil = { att: -1, def: -1 };
+    const acc = [new Map(), new Map()]; // [att, def] : base → mesures
+    const get = (side, name) => {
+        const m = acc[side === 'att' ? 0 : 1];
+        const base = String(name).replace(/@.*/, '');
+        return m.get(base) || m.set(base, { rolls: [], critRolls: [], hits: 0, crits: 0, received: 0, riposted: 0 }).get(base);
+    };
+    for (const l of log.lines) {
+        if (l.kind === 'ability') {
+            if (/rage/i.test(l.text || '') && (l.side === 'att' || l.side === 'def')) {
+                rageUntil[l.side] = l.t + 1000;
+            }
+            continue;
+        }
+        if (l.kind !== 'hit') continue;
+        const foeSide = l.side === 'att' ? 'def' : 'att';
+        if (l.riposte) {
+            get(l.side, l.from).riposted += 1;
+            continue;
+        }
+        const e = get(l.side, l.from);
+        e.hits += 1;
+        if (l.crit) e.crits += 1;
+        get(foeSide, l.to).received += 1;
+        if (!l.dmg || !l.fromQty || l.t === 0 || l.t <= rageUntil[l.side]) continue;
+        (l.crit ? e.critRolls : e.rolls).push(l.dmg / l.fromQty);
+    }
+    return acc.map((m) => {
+        const out = new Map();
+        for (const [k, e] of m) {
+            out.set(k, {
+                roll: e.rolls.length >= 3 ? median(e.rolls) : null,
+                critRate: e.hits >= 8 ? round((100 * e.crits) / e.hits, 1) : null,
+                critMult: e.rolls.length >= 3 && e.critRolls.length >= 2
+                    ? round(median(e.critRolls) / median(e.rolls), 2) : null,
+                counterRate: e.received >= 8 ? round((100 * e.riposted) / e.received, 1) : null,
+            });
+        }
+        return out;
+    });
+}
+
+/** Mode des derniers écarts entre coups d'une pile : sa cadence de croisière, en centièmes. */
+function stableInterval(times) {
+    if (times.length < 3) return null;
+    const diffs = times.slice(1).map((t, i) => t - times[i]).filter((d) => d > 0);
+    if (!diffs.length) return null;
+    const tail = diffs.slice(-6);
+    const count = new Map();
+    for (const d of tail) count.set(d, (count.get(d) || 0) + 1);
+    // le plus fréquent ; à égalité, le plus GRAND (les petits viennent d'accélérations temporaires)
+    return [...count.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0][0];
 }
 
 /* ---------- Agrégats ---------- */
@@ -410,6 +495,7 @@ function opponents(rows) {
             e.unitHp.push(p.unitHp);
             if (Number.isFinite(p.dpuPerHit)) e.dpu.push(p.dpuPerHit);
             if (Number.isFinite(p.interval)) e.intervals.push(p.interval);
+            if (Number.isFinite(p.intervalCs)) (e.intervalsCs ||= []).push(p.intervalCs);
             e.bonuses.push(p.gearBonuses || {});
             for (const g of p.gear || []) {
                 const k = `${g.slot}/${g.item}`;
@@ -440,6 +526,8 @@ function opponents(rows) {
             intervalMeasured: round(interval, 2),
             // Cadence pile par pile plutôt que cumulée : plus fidèle quand une pile tombe tôt.
             intervalMedian: round(median(e.intervals), 2),
+            // La cadence EXACTE (mode des écarts entre coups) : c'est elle que le moteur rejoue.
+            intervalCs: Number.isFinite(median(e.intervalsCs || [])) ? Math.round(median(e.intervalsCs)) : null,
             dpsPerUnit: interval ? round(dpuPerHit / interval, 0) : null,
             reinforcements: e.reinf,
             // Équipement d'en face : la médiane de chaque affixe, et les pièces les plus portées.
@@ -472,21 +560,39 @@ function mechanics(rows, reports, meId) {
     const fortSeen = [...new Set(rows.map((r) => r.fort.theirs).filter(Boolean))].sort((a, b) => a - b);
     return {
         tick: 'centièmes de seconde (result.cs = durée du combat)',
-        damageFormula: 'unités vivantes × tirage(dégâts min…max) × (critique ? 1,5) × (1 − fortification)',
+        damageFormula: 'vivants × tirage uniforme(min…max) × (critique ? ×1,5 à ×2,5) × (1 − fort/100), '
+            + 'avec vivants = ceil(PV restants ÷ PV unitaires) — vérifié à l’unité près sur ~4 900 coups',
+        timing: 'une pile frappe à intervalle CONSTANT round(vitesse × 100) centièmes ; seul le premier '
+            + 'coup est tiré au sort, entre 0,90 et 1,00 × l’intervalle. Frénésie et Dernier carré '
+            + 'divisent l’intervalle par 1,5, temporairement.',
+        counter: 'riposte avec la probabilité « riposte % » de la cible ; les unités qui ripostent valent '
+            + 'min(vivants de la cible, vivants de l’attaquant) — vérifié sur 1 265 ripostes — à 60 % '
+            + 'd’un tirage normal, et jamais critique (0 sur 1 346).',
+        shield: 'le bouclier est un POOL COMMUN à l’armée : 8,00 % des PV de DÉPART (pas du max), '
+            + 'consommé avant les PV quel que soit le groupe touché.',
         matchups,
         roleEffectOnDamage: 'mesuré nul : à rôle d’attaquant donné, les dégâts par unité ne dépendent '
             + 'pas du rôle de la cible (voir le tableau ci-dessus, tous les rapports valent ≈ 1,00). '
             + 'Le triangle des rôles n’agit donc pas sur les dégâts dans cet historique.',
-        targeting: 'cible tirée au sort, pondérée par les PV de la pile adverse (la première cible est '
-            + 'la plus grosse pile dans la moitié des cas, jamais le rôle dominé)',
+        targeting: 'cible tirée au sort, pondérée par les PV restants de chaque pile adverse',
         abilityMagnitudes: {
-            shield: '8 % des PV de l’armée (mesuré : 8,00 %)',
-            second_wind: '12 % des PV perdus rendus (mesuré : 11,3 % des PV max)',
-            shockwave: '≈ 6,8 % des PV de l’armée adverse (mesuré ; non documenté dans les règles)',
-            rage: '+35 % de dégâts pendant 10 s',
-            ambush: 'un coup gratuit à 40 % de la puissance, à t = 0',
-            frenzy: '+50 % de vitesse pendant 2 s',
+            shield: '8,00 % des PV de départ de l’armée, en pool commun (mesuré exact)',
+            second_wind: 'sous 30 % des PV max : chaque pile récupère min(12 % de ses PV de départ, '
+                + 'retour à ses PV de départ) — montants vérifiés à l’unité près',
+            shockwave: 'quand l’adversaire a perdu 30 % de ses PV de DÉPART : chaque pile adverse perd '
+                + 'le même pourcentage de ses PV courants ; total ≈ 10 % des PV courants du camp '
+                + 'lanceur × (1 − fort), résidu ±20 %',
+            rage: 'sous 50 % des PV max : ×1,350 sur les dégâts (mesuré) pendant 10 s',
+            ambush: 'un coup gratuit par pile à t = 0, à 40 % de la puissance (mesuré 0,39–0,42), '
+                + 'critique possible',
+            frenzy: 'vitesse ×1,5 pendant 2 s (le délai du premier coup n’en profite pas)',
         },
+        critMult: 'multiplicateur critique ×1,5 de base ; ×2,0 avec le talent Executioner (mesuré 1,98) ; '
+            + '×2,5 pour une pile qui porte Saignée. Propre à chaque joueur — mesuré par adversaire '
+            + 'dans les journaux.',
+        opponentTalents: 'les talents de DÉGÂTS adverses sont invisibles dans les PV servis ; mesurés '
+            + 'par joueur et par type via les tirages des journaux (facteur ×0,65 à ×1,5 selon le '
+            + 'joueur), et appliqués aux reconstructions du simulateur.',
         fortSeen,
         medianFightSeconds: round(median(rows.map((r) => r.seconds)), 1),
     };

@@ -34,12 +34,16 @@ npm run all        # check + fights
 npm run rules      # règles officielles du site → docs/regles.md (sans connexion)
 npm run troops     # fiches des troupes relevées en jeu → data/troops.json + docs/troupes.md
 npm run skills     # ton arbre de talents → data/skills.json
+npm run hq         # ressources, bâtiments, niveau, points de compétence → data/hq.json
+npm run report     # compte rendu Markdown pour un agent IA → docs/rapport.md (sans connexion)
+npm run assets     # images du jeu (troupes, objets, avatars) → data/assets/ (sans connexion)
 npm run analyse    # bilan + compositions dans le terminal → out/analysis.json
 npm run explore    # dépose les réponses brutes du jeu dans data/raw/ (debug)
 ```
 
-Seuls `update`, `check`, `fights`, `troops`, `skills` et `explore` ouvrent un navigateur et se connectent.
-`enemies`, `analyse` et `rules` ne lisent que des fichiers — relance-les autant que tu veux.
+Seuls `update`, `check`, `fights`, `troops`, `skills`, `hq` et `explore` ouvrent un navigateur et
+se connectent. `enemies`, `analyse` et `report` ne lisent que des fichiers, `rules` et `assets`
+n'interrogent que des URLs publiques — relance-les autant que tu veux.
 
 Options (après `--` avec npm, ou directement) :
 
@@ -61,6 +65,8 @@ traitements que la CLI. Rien n'est écrit vers le jeu : on lit, on analyse, on s
 | Écran | Ce qu'on y trouve |
 | --- | --- |
 | **Tableau de bord** | le bouton **Mettre à jour**, ce qu'il y a en base, et où en est la reprise de l'historique |
+| *(barre du haut)* | tes ressources, toujours visibles, avec leur jauge de remplissage |
+| **Le QG** | ressources, bâtiments, niveau, points de compétence — et l'export Markdown pour un agent IA |
 | **Analyse des combats** | bilan, rendement par type, capacités gaspillées, vivier adverse, équipement comparé, fiabilité du simulateur |
 | **Adversaires** | une fiche par joueur croisé : son armée, ses objets, l'historique daté de ses changements de troupes |
 | **Simulateur** | un duel contre un adversaire réel : rejoue un combat ou éprouve une composition montée à la main |
@@ -77,30 +83,49 @@ reconstruire les fiches, tout retélécharger) sont repliées sous *Actions dét
 
 ## Analyse des combats (`npm run analyse`, onglet Analyse)
 
-Tout vient des rapports de combat (`detail.fight.report`), une fois le format décodé :
+Tout vient des rapports de combat (`detail.fight.report`) **croisés avec le journal rédigé**
+(`/play/view/fightlog`), une fois le format décodé :
 
 - `events` est la frise complète du combat, un tableau par coup :
-  `[t, camp, typeAttaquant, typeCible, dégâts, unitésVivantes, riposte]`. `t` est en **centièmes de
-  seconde** (`result.cs` = durée du combat dans la même unité), `unitésVivantes` vaut 0 quand la pile
-  est au complet, et la riposte compte comme des dégâts subis par l'attaquant.
-- Les dégâts d'un coup valent `unités vivantes × tirage(min…max) × (critique ? 1,5) × (1 − fortification)`,
-  et les unités vivantes suivent la part de PV restante du groupe. Vérifié coup par coup.
+  `[t, camp, typeAttaquant, typeCible, dégâts, X, riposte]`. `t` est en **centièmes de seconde**
+  (`result.cs` = durée du combat dans la même unité). Le champ `X` ressemble aux unités vivantes
+  mais n'est **pas fiable** (il vaut parfois 0 alors que la pile a perdu la moitié de ses unités) :
+  la vérité terrain, c'est le `×N` du journal rédigé.
+- La comptabilité exacte, vérifiée à l'unité près sur ~4 900 coups :
+  `vivants = ceil(PV restants ÷ PV unitaires)`, les KO d'un coup sont la différence de ce `ceil`
+  avant/après, et les dégâts valent
+  `vivants × tirage uniforme(min…max) × (critique ? ×1,5 à ×2,5) × (1 − fort/100)`.
+- **Une pile frappe à intervalle constant** `round(vitesse × 100)` centièmes — seul le premier coup
+  est tiré au sort, entre 0,90 et 1,00 × l'intervalle. La frénésie et le dernier carré divisent
+  l'intervalle par 1,5, temporairement. Le reste du déroulé est entièrement déterminé par le seed
+  du serveur (chaque rapport en contient un ; le générateur n'a pas été identifié).
+- **La riposte** se déclenche avec la probabilité « riposte % » de la cible ; les unités qui
+  ripostent valent `min(vivants de la cible, vivants de l'attaquant)` — vérifié sur 1 265
+  ripostes — à 60 % d'un tirage normal, et n'est **jamais critique** (0 sur 1 346).
+- **Le bouclier est un pool commun à l'armée** : 8,00 % des PV de *départ* (pas du max), consommé
+  avant les PV quel que soit le groupe touché — le montant servi par le jeu tombe à l'unité près.
 - `abNeed` / `abOn` donnent le seuil d'activation retenu par le serveur (10 % des places) et les
   capacités qui ont **réellement** fonctionné. C'est la mesure la plus utile : elle dit quelles
   capacités une composition paie sans les utiliser.
-- `abilities` donne l'amplitude réelle de chaque capacité. Bouclier 8 % des PV de l'armée, second
-  souffle ≈ 11,3 %, **onde de choc ≈ 6,8 % des PV de l'armée adverse** — ce dernier chiffre n'est
-  documenté nulle part dans les règles.
+- Les seuils et amplitudes mesurés des capacités : rage sous 50 % des PV max (×1,350 pendant 10 s),
+  second souffle sous 30 % (chaque pile récupère `min(12 % de ses PV de départ, retour à ses PV de
+  départ)` — montants exacts), onde de choc quand l'adversaire a perdu 30 % de ses PV de *départ*
+  (chaque pile adverse perd le même pourcentage de ses PV courants ; total ≈ 10 % des PV courants du
+  camp lanceur × (1 − fort)), embuscade à 40 % de la puissance (critique possible), frénésie ×1,5
+  pendant 2 s.
 
-Deux résultats contre-intuitifs sortent de l'historique :
+Trois résultats contre-intuitifs sortent de l'historique :
 
 - **Le triangle des rôles n'agit pas sur les dégâts.** À rôle d'attaquant donné, les dégâts par
-  unité ne dépendent pas du rôle de la cible (écarts < 2 % sur 1 798 coups, après normalisation par
-  combat et par type qui annule l'équipement). Le ciblage n'est pas non plus orienté par le rôle :
-  la cible est tirée au sort, pondérée par les PV.
-- **En défense, les piles démarrent à 70 % de leurs PV**, parce que l'attaque arrive avant la fin de
-  la récupération ; un attaquant part toujours à 100 %. C'est la première cause des défaites en
-  défense, loin devant la composition.
+  unité ne dépendent pas du rôle de la cible (écarts < 2 % sur 1 798 coups). Le ciblage n'est pas
+  non plus orienté par le rôle : la cible est tirée au sort, pondérée par les PV restants.
+- **En défense, les piles démarrent souvent sous leurs PV max** (récupération inachevée, plancher du
+  poste de garde) ; un attaquant part presque toujours à 100 %. C'est la première cause des défaites
+  en défense, loin devant la composition.
+- **Les talents de dégâts adverses sont invisibles dans les stats servies** — les PV unitaires
+  contiennent l'équipement d'en face, pas ses talents d'attaque. Le journal les trahit : le rapport
+  entre dégâts mesurés et dégâts expliqués par la carte est la signature de ses talents, stable d'un
+  combat à l'autre (×0,65 à ×1,5 selon le joueur). L'onglet Analyse les affiche par adversaire.
 
 ## Le simulateur (onglet Simulateur)
 
@@ -114,21 +139,40 @@ Un duel joué coup par coup contre un adversaire **réel** de ton historique —
   des places, le seuil des capacités affiché en direct (un type sous 10 % des places porte sa
   capacité sans qu'elle agisse — le badge le dit).
 
-Ce que tu obtiens : l'issue et la marge, la **courbe des PV des deux camps** avec les capacités en
-repères, le détail pile par pile (dégâts infligés, subis, PV restants), la frise des capacités
+> Les places de troupes sont un **budget commun** : 875 places, ce n'est pas 875 par type. Chaque
+> curseur s'arrête donc à ce qui reste une fois les autres types servis. Quand tout est distribué,
+> un type ne peut plus que baisser — pour en renforcer un, il faut d'abord en dégarnir un autre,
+> exactement comme en jeu.
+
+Ce que tu obtiens : la **probabilité de victoire** (le duel joué 600 fois avec de vrais tirages),
+la marge et la durée avec leur fourchette, la **courbe des PV des deux camps** (la passe la plus
+typique des 600) avec les capacités en repères, le détail pile par pile, la frise des capacités
 déclenchées — et, pour éviter de conclure sur un seul duel, le bilan de la même composition
 **contre les combats archivés**.
 
 Depuis l'onglet Compositions, chaque proposition a un bouton *Essayer dans le simulateur* qui la
 charge directement.
 
-> Le moteur est déterministe : il calcule des espérances, pas un tirage. Deux compositions se
-> comparent donc sans bruit, mais un vrai combat garde sa part de hasard.
+### Pourquoi le verdict est une probabilité
+
+Le moteur (`src/engine.mjs`) rejoue les **mécaniques exactes du jeu** — intervalles déterministes,
+tirages uniformes min…max, critiques, ripostes, ciblage pondéré par les PV, boucliers en pool,
+seuils et amplitudes mesurés — mais le jeu tire les dégâts et les critiques **au hasard**, avec un
+seed serveur qu'on ne peut pas prédire. L'archive en contient la preuve directe : les combats
+**11055** et **11060** opposent exactement les mêmes armées, avec les mêmes fortifications et les
+mêmes capacités — l'un est gagné, l'autre perdu.
+
+Le simulateur joue donc chaque duel en **Monte-Carlo** (600 passes seedées, reproductibles) et
+annonce la part de victoires. Entre 25 % et 75 %, il affiche **« Trop serré »** plutôt que de
+désigner un vainqueur. En face, il rappelle la lecture historique : parmi tes combats passés à
+marge simulée comparable, combien ont été réellement gagnés.
 
 ## Recherche de compositions (onglet Compositions)
 
-`src/sim.mjs` rejoue un combat de façon **déterministe** (espérances, pas de tirage) avec les
-mécaniques ci-dessus, puis cherche la meilleure composition.
+`src/sim.mjs` cherche la meilleure composition en deux temps : un criblage **déterministe** (mode
+« espérances » du moteur : chaque tirage remplacé par sa moyenne — deux compositions se comparent
+sans bruit), puis un **Monte-Carlo** sur les finalistes qui affiche leur vraie part de victoires,
+tirages compris.
 
 - **Recherche** : toutes les combinaisons de types débloqués (jusqu'à 4, ou 5 avec l'Annexe),
   réparties par dixièmes des places — le seuil des capacités valant 10 % des places, chaque part non
@@ -169,45 +213,40 @@ nœuds, tous décodés. Sur ce compte, la branche Défense est à 0 point, donc 
 n'apportent aucun bonus de vie** : tout l'écart de PV d'un type équipé vient de son matériel,
 bonus intrinsèque compris. C'est ce qui rend ce dernier mesurable.
 
-**Le multiplicateur de critique** en dépend aussi. Le jeu part de ×1,5 et le talent *Executioner*
-annonce « +50 % de dégâts critiques », sans dire si la prime passe de +50 % à +100 % (×2,0) ou si
-les dégâts critiques gagnent 50 % (×2,25). On ne tranche pas au jugé : `calibrateCrit()` rejoue
-l'historique avec les trois hypothèses et retient la meilleure. Verdict sans appel — ×2,25 donne
-90,2 % de justesse contre 85,2 % pour ×1,5 et ×2,0.
+**Le multiplicateur de critique** n'est plus deviné : le journal de combat marque les coups
+critiques, et le rapport entre les tirages critiques et normaux d'une même pile dans un même combat
+le **mesure** directement — ×1,98 pour moi (talent *Executioner* : la prime passe de +50 % à
++100 %, donc ×2,0), ×1,5 en face par défaut. Les adversaires dont les journaux montrent ×2,0 sont
+détectés individuellement et simulés avec.
 
 ### Comment une pile adverse est reconstruite
 
-Trois sources, chacune à sa place :
+Quatre sources, chacune à sa place :
 
-1. **servi par le serveur** — les PV unitaires. Équipement, talents et bonus de famille d'en face y
-   sont déjà ;
-2. **mesuré dans la frise des coups** — la cadence réelle de la pile (durée du combat ÷ coups
-   portés) ;
-3. **carte du shop + équipement relevé** — les stats **de base** du type (sans *tes* talents ni
-   *ton* matériel, qui ne sont pas les siens), au niveau de type de la pile, auxquelles on applique
-   les affixes de ses trois pièces.
+1. **servi par le serveur** — les PV unitaires. Équipement, talents de vie et bonus de famille d'en
+   face y sont déjà ;
+2. **mesuré dans la frise des coups** — la cadence EXACTE de la pile (mode des écarts entre coups,
+   en centièmes : l'intervalle est constant). Elle intègre les bonus de vitesse intrinsèques des
+   objets, que le jeu ne publie pas ;
+3. **carte du shop + équipement relevé** — les stats **de base** du type au niveau de type de la
+   pile, plus les affixes de ses trois pièces ;
+4. **appris dans ses journaux** — le facteur de dégâts du joueur (ses talents d'attaque, invisibles
+   dans les PV), son taux de critique, son taux de riposte et son multiplicateur critique, mesurés
+   sur ses combats passés. En backtest, le combat rejoué est exclu de sa propre mesure
+   (**leave-one-out**) pour ne pas gonfler le score.
 
-Ce que ça change, mesuré sur les 59 combats en base :
+Fiabilité obtenue sur les 68 combats en base, informations d'avant-combat seulement :
+**justesse 85,3 %** (attaque 93,5 %, défense 78,4 %), **AUC 0,91**, **score de Brier 0,13**
+(0 = parfait, 0,25 = pile ou face) — et les durées simulées collent enfin aux vraies
+(médiane 1,06× la durée réelle).
 
-| Reconstruction | Justesse | Pouvoir de classement (AUC) |
-| --- | ---: | ---: |
-| Stats de la carte seules (point de départ) | 76,3 % | 0,783 |
-| + affixes d'équipement | 84,7 % | 0,873 |
-| + cadence mesurée | 86,4 % | 0,892 |
-| + niveau de type additif (au lieu de composé) | 85,2 % | 0,886 |
-| + talents et multiplicateur de critique calibré (**retenu**) | **90,2 %** | **0,900** |
+Les **dégâts par coup bruts** (`dpuPerHit`) ne servent que de repli pour un type sans fiche : ils
+incluent rage et frénésie que le moteur réapplique ensuite. La mesure propre (`rollMedian`) exclut
+critiques, ripostes, embuscades, fenêtres de rage et coups absorbés par un bouclier.
 
-> La correction du niveau de type fait perdre un combat sur 61 — du bruit, pas un signal. On garde
-> la formule mesurée plutôt que celle qui colle d'un cheveu de mieux à un échantillon court.
-
-Les **dégâts par coup mesurés** ne sont volontairement *pas* utilisés : ils incluent les capacités
-qui augmentent les dégâts en cours de combat (rage, frénésie, dernier carré) que le simulateur
-réapplique ensuite, et les employer fait *baisser* le classement (0,892 → 0,869). Ils ne servent
-que de repli pour un type dont le jeu ne sert pas encore la fiche.
-
-> Ce qui n'est pas modélisé : renforts de famille, bonus intrinsèques des objets (non publiés par
-> le jeu), capacités adverses mal documentées (coup de grâce, corruption) et la dispersion des
-> tirages de dégâts.
+> Ce qui n'est pas modélisé : renforts de famille, objets que tu pourrais forger, capacités jamais
+> croisées en combat (gel du temps, intimidation, forteresse, dernier carré, coup de grâce, renvoi,
+> corruption — encodées depuis les règles), et le résidu ±20 % de l'onde de choc.
 
 Code de sortie : `0` si tout passe, `1` si un check échoue, si un combat n'a pas pu être téléchargé
 ou **si un trou a été constaté dans l'historique** — utilisable tel quel en cron ou en CI :
@@ -250,8 +289,37 @@ Le script utilise l'API interne du jeu plutôt que de scraper l'écran :
 2. **Détails** — `GET /play/fight?id=<id>` renvoie le combat complet en JSON
    (`{ ok, fight, names, imgs, res }`), exactement ce que le rejeu utilise (déroulé, unités,
    capacités, bâtiments pillés…).
-3. **Fusion** — chaque run ne télécharge que les ids absents de `data/fights.json`. Relancer la
+3. **Journal** — `GET /play/view/fightlog?id=<id>` donne le déroulé tel que le jeu le rédige. Il
+   porte deux choses que le JSON ne donne **pas** : quels coups ont été **critiques**, et combien
+   d'unités chaque coup a mises **KO**. Il est converti en lignes structurées (~12 Ko au lieu des
+   72 Ko de HTML) et stocké avec le combat. Les combats déjà en base sont rattrapés par lots de 40
+   par passage, du plus récent au plus ancien.
+4. **Fusion** — chaque run ne télécharge que les ids absents de `data/fights.json`. Relancer la
    commande à tout moment ne récupère donc que les nouveaux combats.
+
+Dans l'onglet **Analyse des combats**, cliquer **n'importe où sur la ligne** d'un combat ouvre son
+journal coup par coup, avec les deux armées, les capacités déclenchées et les coups critiques.
+
+La fiche d'un combat porte aussi un bouton **« Copier pour un agent IA »** (et son jumeau
+*Télécharger .md*) : tout le combat en Markdown — issue, les deux armées pile par pile avec leur
+équipement, les talents adverses mesurés, le journal coup par coup, l'avis du simulateur
+(probabilité du combat rejoué, meilleure composition possible) et les limites connues — prêt à
+coller dans une conversation pour demander *pourquoi, et quoi changer*. Servi aussi directement sur
+`/api/fight.md?id=<id>`. Un résultat de **simulation** s'exporte de la même façon depuis l'onglet
+Simulateur.
+
+La fiche porte enfin un bouton **« Trouver la meilleure composition »** : toutes les
+combinaisons de types sont jouées contre *ce* combat précis (même adversaire, mêmes murs, et en
+défense la forme réelle de tes troupes ce jour-là), les finalistes départagés au Monte-Carlo. Le
+podium s'affiche avec sa probabilité de victoire, comparé à ce que tu avais engagé et à ta
+composition actuelle — et chaque proposition se rejoue d'un clic : **« Simuler ce duel
+maintenant »** précharge le simulateur sur ce combat avec cette composition et lance le duel.
+Quand aucune composition ne gagne, la page le dit en face — et chiffre ce qu'auraient changé des
+troupes soignées.
+
+Les sous-pages ont leur propre adresse — `#combat/11086`, `#adversaire/199` — donc un lien se
+partage, le bouton du navigateur marche, et le bouton **Retour** rend la liste à la position où on
+l'avait laissée.
 
 ### La reprise, et son seul point de fragilité
 
@@ -320,6 +388,36 @@ Le script ne se contente donc plus de télécharger : il tient un **repère de r
 
 Index par id : la fusion est idempotente et l'écriture atomique (un run interrompu ne laisse pas
 de fichier tronqué).
+
+## Le quartier général (`npm run hq`, onglet Le QG)
+
+Deux sources, toutes deux ouvertes par la session : `GET /play/state` pour le joueur (ressources,
+capacités, production, niveau et XP, points de compétence, attaques restantes, famille, rang) et
+`GET /play/buildings` pour la ville — chaque bâtiment posé, avec son niveau, son maximum, ses PV
+et le chantier en cours s'il y en a un.
+
+Comme le reste, `data/hq.json` **accumule** : un point d'historique s'ajoute dès qu'une valeur
+suivie change (niveau, classement, points libres, nombre de bâtiments). On voit donc sa progression
+sans avoir rien eu à prévoir.
+
+L'écran signale les deux choses qui coûtent sans se voir : les **points de compétence non
+dépensés** et les **stocks au plafond**, où toute production supplémentaire est perdue.
+
+## Le compte rendu pour un agent IA (`npm run report`)
+
+Un seul document Markdown qui rassemble tout : QG, ressources, bâtiments, troupes avec leur XP de
+type, arbre de talents, équipement comparé au leur, bilan de combat, vivier adverse et compositions
+proposées. À télécharger ou à copier depuis l'onglet **Le QG**, ou à récupérer directement sur
+`http://127.0.0.1:4173/api/report.md`.
+
+Il est écrit pour être *lu par un modèle*, ce qui impose trois règles :
+
+- **des chiffres déjà agrégés**, pas un vidage de 2 Mo de JSON — l'agrégation est le travail qu'un
+  modèle fait mal et qu'on a déjà fait ici ;
+- **ce qui est mesuré est annoncé comme tel**, ce qui est modélisé aussi, avec la fiabilité du
+  simulateur chiffrée ;
+- **une section « limites connues »** en clair. Un agent qui ignore ce qu'il ne sait pas donne de
+  mauvais conseils avec aplomb.
 
 ## Adversaires et équipements (`npm run enemies`, onglet Adversaires)
 
@@ -407,6 +505,44 @@ d'arrestation).
 > ni un paramètre d'URL ne la changent. Les noms d'unité, descriptions et libellés sont donc relevés
 > dans cette langue — le document le signale et complète avec les noms et effets français des règles.
 
+## Les images du jeu (`npm run assets`)
+
+L'interface affiche les vignettes des troupes, les icônes d'objets et les photos de profil des
+joueurs. Elles sont **copiées en local**, pas chargées depuis le site : une page qui pointe vers le
+jeu ne s'afficherait pas hors ligne, et signalerait au serveur chaque consultation de ton tableau de
+bord.
+
+Tout est servi en clair par le jeu, sans session — un `fetch` suffit, comme pour les règles.
+
+| Dans `data/assets/` | Quoi |
+| --- | --- |
+| `units/<clé>.webp` | le portrait entier d'un type, pour sa fiche |
+| `units/face/<clé>.webp` | la vignette, pour une ligne de tableau |
+| `avatars/<fichier>.webp` | la photo de profil d'un joueur |
+| `icons.svg` | le sprite complet : les 30 icônes d'objets y sont des `<symbol>` |
+
+82 fichiers, 1,5 Mo. Le téléchargement est **incrémental** comme le reste : un fichier déjà présent
+n'est pas redemandé, `npm run assets -- --force` reprend tout.
+
+Deux détails qui comptent :
+
+- les **avatars portent un condensat** dans leur nom (`94-e98ac806d605a596.webp`). Quand quelqu'un
+  change de photo, c'est un nouveau fichier : rien à invalider, et l'ancienne reste disponible pour
+  les combats d'alors ;
+- les **icônes d'objets sont monochromes** (`fill="currentColor"`) et vivent toutes dans un seul
+  sprite. Une requête au lieu de trente, et l'interface les **teinte par rareté** en CSS — vert
+  pour Rare, violet pour Épique, ambre pour Légendaire.
+
+Les **21 types sont téléchargés d'avance**, y compris ceux que ton personnage n'a pas encore
+débloqués : leurs images existent déjà côté serveur, autant éviter que l'interface se troue en
+montant de niveau.
+
+Rien de tout ça n'est dans Git (`data/` est ignoré) : ce sont les images du jeu, en cache local
+pour ton usage.
+
+> Une image absente ne casse jamais l'affichage : la vignette disparaît, l'avatar retombe sur
+> l'initiale du pseudo. L'interface reste entièrement lisible sans aucune image.
+
 ## Réglages (`.env`)
 
 | Variable | Défaut | Rôle |
@@ -431,16 +567,18 @@ src/enemies.mjs   projection des combats → fiches d'adversaires et historique 
 src/gear.mjs      modèle d'équipement : affixes, raretés, catalogue d'objets, docs/objets.md
 src/troops.mjs    cartes du shop → data/troops.json + docs/troupes.md (niveau et XP de type)
 src/skills.mjs    arbre de talents → data/skills.json (sépare talents et équipement)
+src/assets.mjs    images du jeu → data/assets/ (sans navigateur, URLs publiques)
 src/rules.mjs     règles publiques → docs/regles.md (sans navigateur)
 src/analyse.mjs   lecture des rapports de combat : tout le mesuré
-src/sim.mjs       moteur de combat (avec trace du déroulé), backtest, recherche de compositions
+src/engine.mjs    le moteur de combat : mécaniques exactes du jeu, mode espérance + Monte-Carlo seedé
+src/sim.mjs       reconstruction des armées, mesures apprises par adversaire, backtest, compositions
 src/server.mjs    serveur local de l'interface (http + SSE, sans dépendance)
 src/explore.mjs   dump des réponses brutes (debug)
 src/index.mjs     CLI
 web/              l'interface (index.html, style.css, app.js)
 docs/             documents générés (versionnés)
 data/             l'archive : fights.json (source), enemies.json + items.json (projections),
-                  troops.json et skills.json (relevés de compte)
+                  troops.json et skills.json (relevés de compte), assets/ (images)
 ```
 
 Les fichiers de `data/` ne sont **pas** dans Git (`.gitignore`) : ils contiennent l'activité de ton

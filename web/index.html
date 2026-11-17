@@ -25,6 +25,7 @@
 
     <nav class="nav" aria-label="Sections">
       <a href="#tableau" data-view="tableau"><i class="dot"></i>Tableau de bord</a>
+      <a href="#qg" data-view="qg"><i class="dot"></i>Le QG</a>
       <a href="#analyse" data-view="analyse"><i class="dot"></i>Analyse des combats</a>
       <a href="#adversaires" data-view="adversaires"><i class="dot"></i>Adversaires</a>
       <a href="#simulateur" data-view="simulateur"><i class="dot"></i>Simulateur</a>
@@ -44,6 +45,8 @@
   </aside>
 
   <main class="stage" id="stage">
+    <div class="resbar" id="resbar" hidden></div>
+
     <div class="view" id="view-tableau" hidden>
       <header class="view-head">
         <p class="kicker">État des lieux</p>
@@ -73,17 +76,34 @@
           <button class="act act-small" data-action="fetch-troops">
             <span class="act-body"><strong>Troupes seulement</strong><em>Stats, capacités et coûts depuis le shop</em></span>
           </button>
+          <button class="act act-small" data-action="fetch-hq">
+            <span class="act-body"><strong>Relever le QG</strong><em>Ressources, bâtiments, niveau, points de compétence</em></span>
+          </button>
           <button class="act act-small" data-action="rebuild-enemies">
             <span class="act-body"><strong>Reconstruire les fiches</strong><em>Reprojette adversaires et objets, sans connexion</em></span>
           </button>
           <button class="act act-small" data-action="fetch-rules">
             <span class="act-body"><strong>Régénérer les règles</strong><em>Reconvertit la page officielle en Markdown</em></span>
           </button>
+          <button class="act act-small" data-action="fetch-assets">
+            <span class="act-body"><strong>Images du jeu</strong><em>Portraits, icônes et avatars, copiés en local</em></span>
+          </button>
           <button class="act act-small" data-action="fetch-fights-refresh">
             <span class="act-body"><strong>Tout retélécharger</strong><em>Reprend le détail de chaque combat archivé</em></span>
           </button>
         </section>
       </details>
+    </div>
+
+    <div class="view" id="view-qg" hidden>
+      <header class="view-head">
+        <p class="kicker">Ressources, bâtiments, progression</p>
+        <h1>Le QG</h1>
+        <p class="lede">L’état du compte tel que le jeu le sert : ressources et production, chaque
+          bâtiment avec son niveau, les points de compétence — et l’export Markdown pour demander
+          conseil à un agent IA.</p>
+      </header>
+      <div id="qg-body"><p class="empty">Chargement…</p></div>
     </div>
 
     <div class="view doc-view" id="view-regles" hidden>
@@ -117,13 +137,23 @@
       <div id="adversaires-body"><p class="empty">Chargement…</p></div>
     </div>
 
+    <!-- Sous-page : la fiche d'un adversaire (#adversaire/<id>). Son en-tête est rendu par app.js. -->
+    <div class="view" id="view-adversaire" hidden>
+      <div id="adversaire-body"><p class="empty">Chargement…</p></div>
+    </div>
+
     <div class="view" id="view-analyse" hidden>
       <header class="view-head">
         <p class="kicker">Mesuré, pas estimé</p>
         <h1>Analyse des combats</h1>
         <p class="lede">Chiffres lus dans les rapports de combat du jeu : rien n’est extrapolé ici.</p>
       </header>
-      <div id="analyse-body"><p class="empty">Clique sur <strong>Analyser</strong> depuis le tableau de bord.</p></div>
+      <div id="analyse-body"><p class="empty">Chargement…</p></div>
+    </div>
+
+    <!-- Sous-page : le journal d'un combat (#combat/<id>). Son en-tête est rendu par app.js. -->
+    <div class="view" id="view-combat" hidden>
+      <div id="combat-body"><p class="empty">Chargement…</p></div>
     </div>
 
     <div class="view" id="view-simulateur" hidden>
@@ -144,7 +174,7 @@
         <p class="lede">Chaque composition est jouée contre tous les adversaires de ton historique,
           avec tes fortifications et l’état réel de tes troupes.</p>
       </header>
-      <div id="compos-body"><p class="empty">Clique sur <strong>Proposer une composition</strong> depuis le tableau de bord.</p></div>
+      <div id="compos-body"><p class="empty">Chargement…</p></div>
     </div>
   </main>
 </div>

@@ -8,7 +8,7 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const state = {
     analysis: null, backtest: null, compos: null, docs: {}, busy: null,
-    enemies: null, enemy: null,
+    enemies: null, enemy: null, hq: null,
 };
 
 /* ── Démarrage ─────────────────────────────────────────────────────────────── */
@@ -26,12 +26,27 @@ async function init() {
 
 /* ── Navigation ────────────────────────────────────────────────────────────── */
 
+/* Adresse d'où l'on vient. Le bouton « Retour » d'une sous-page s'en sert pour choisir entre deux
+   gestes qui ne se valent pas : si on arrive bien de la liste annoncée sur le bouton,
+   `history.back()` la rend **avec sa position de défilement** ; sinon on pose son adresse. Un
+   bouton qui dit « Tous les adversaires » doit mener là, pas à la page précédente quelle qu'elle
+   soit — sans quoi il ment, et il peut même faire sortir du site. */
+let previousRoute = null;
+/* Un retour en arrière doit rendre la liste là où on l'avait laissée — sur un tableau de 68
+   lignes, repartir du haut annule l'intérêt du bouton. Le navigateur sait restaurer la position
+   tout seul sur une navigation d'historique ; il suffit de ne pas la lui écraser. */
+let restoringScroll = false;
+
 function wireNav() {
-    addEventListener('hashchange', () => show(location.hash.slice(1) || 'tableau'));
+    addEventListener('hashchange', (e) => {
+        previousRoute = new URL(e.oldURL).hash.slice(1) || 'tableau';
+        show(location.hash.slice(1) || 'tableau');
+    });
 }
 
 const VIEWS = {
     tableau: { title: 'Tableau de bord' },
+    qg: { title: 'Le QG' },
     analyse: { title: 'Analyse des combats' },
     adversaires: { title: 'Adversaires' },
     simulateur: { title: 'Simulateur' },
@@ -39,25 +54,60 @@ const VIEWS = {
     regles: { title: 'Les règles', doc: 'regles.md' },
     troupes: { title: 'Les troupes', doc: 'troupes.md' },
     objets: { title: 'Les objets', doc: 'objets.md' },
+    /* Sous-pages : elles ont leur propre adresse (`#combat/11060`), donc le bouton « Retour »
+       et celui du navigateur font la même chose, et un lien se partage. `parent` sert à garder
+       l'entrée de menu correspondante allumée. */
+    combat: { title: 'Combat', parent: 'analyse', arg: true },
+    adversaire: { title: 'Adversaire', parent: 'adversaires', arg: true },
 };
 
 /* Une vue se remplit toute seule à la première visite : plus de bouton « Analyser » à cliquer
    avant de voir quoi que ce soit. Tout ce qui est affiché ici se calcule hors ligne, à partir de
    data/ — le seul geste qui demande le jeu est « Mettre à jour ». */
-async function show(name) {
+async function show(route) {
+    const [name, arg] = String(route || '').split('/');
     const view = VIEWS[name] ? name : 'tableau';
+    const meta = VIEWS[view];
+
     for (const el of $$('.view')) el.hidden = el.id !== `view-${view}`;
+    // Une sous-page garde allumée l'entrée de menu dont elle dépend.
+    const current = meta.parent || view;
     for (const a of $$('.nav a')) {
-        if (a.dataset.view === view) a.setAttribute('aria-current', 'page');
+        if (a.dataset.view === current) a.setAttribute('aria-current', 'page');
         else a.removeAttribute('aria-current');
     }
-    document.title = `SSS — ${VIEWS[view].title}`;
-    if (VIEWS[view].doc) await openDoc(view, VIEWS[view].doc);
+    document.title = `SSS — ${meta.title}`;
+
+    if (meta.doc) await openDoc(view, meta.doc);
     if (view === 'analyse' && !state.analysis) await runAnalyse({ silent: true });
     if (view === 'adversaires' && !state.enemies) await loadEnemies();
     if (view === 'simulateur' && !simu.types) await loadSimu();
+    if (view === 'qg' && !state.hq) await loadHq();
     if (view === 'compos' && !state.compos) await runCompos({ silent: true });
-    scrollTo({ top: 0, behavior: 'instant' });
+    if (view === 'combat') await openFight(arg);
+    if (view === 'adversaire') await openEnemy(arg);
+    if (restoringScroll) restoringScroll = false;
+    else scrollTo({ top: 0, behavior: 'instant' });
+}
+
+/* Bouton « Retour » d'une sous-page. On passe par l'historique du navigateur quand on peut : ça
+   rend la position de défilement de la liste, ce qu'un simple changement d'adresse ne ferait pas.
+   Si ça n'a pas bougé (page ouverte directement par son lien), on remonte à la vue parente. */
+function backLink(to, label) {
+    return `<button type="button" class="back-btn" data-back="${esc(to)}">
+        <span aria-hidden="true">←</span> ${esc(label)}</button>`;
+}
+
+function wireBack(host) {
+    for (const b of $$('[data-back]', host)) {
+        b.addEventListener('click', () => {
+            const to = b.dataset.back;
+            if (previousRoute === to) {
+                restoringScroll = true;
+                history.back();
+            } else location.hash = to;
+        });
+    }
 }
 
 /* ── Actions ───────────────────────────────────────────────────────────────── */
@@ -76,6 +126,8 @@ async function act(action, btn) {
         'fetch-troops': () => post('fetch-troops'),
         'fetch-rules': () => post('fetch-rules?locale=fr'),
         'rebuild-enemies': () => post('rebuild-enemies'),
+        'fetch-assets': () => post('fetch-assets'),
+        'fetch-hq': () => post('fetch-hq'),
     };
     if (!jobs[action]) return;
     const others = $$('[data-action]');
@@ -99,6 +151,7 @@ async function post(route) {
     state.compos = null;
     state.enemies = null;
     state.enemy = null;
+    state.hq = null;
     simu.types = null;
     simu.result = null;
     state.docs = {};
@@ -108,13 +161,26 @@ async function post(route) {
 
 function summarise(route, result) {
     if (route.startsWith('update-all')) {
-        return [fightsLine(result?.fights), `${result?.troops?.units ?? '?'} unités relevées`].join(' · ');
+        return [
+            fightsLine(result?.fights),
+            `${result?.troops?.units ?? '?'} unités`,
+            result?.hq ? `QG niveau ${result.hq.level}` : null,
+        ].filter(Boolean).join(' · ');
     }
     if (route.startsWith('fetch-fights')) return fightsLine(result);
     if (route.startsWith('fetch-troops')) return `${result?.units ?? '?'} unités relevées.`;
     if (route.startsWith('fetch-rules')) return `Règles régénérées (${result?.sections ?? '?'} sections).`;
     if (route.startsWith('rebuild-enemies')) {
         return `${result?.enemies ?? '?'} adversaires, ${result?.changes ?? '?'} changements de troupes, ${result?.items ?? '?'} objets.`;
+    }
+    if (route.startsWith('fetch-hq')) {
+        return `Niveau ${result?.level ?? '?'} · ${result?.buildings ?? '?'} bâtiments`
+            + (result?.skillPoints ? ` · ${result.skillPoints} point(s) de compétence libre(s)` : '');
+    }
+    if (route.startsWith('fetch-assets')) {
+        return result?.downloaded
+            ? `${result.downloaded} image(s) téléchargée(s) · ${result.total} en local.`
+            : `Rien de neuf : les ${result?.total ?? '?'} images sont déjà en local.`;
     }
     return 'Terminé.';
 }
@@ -141,8 +207,38 @@ async function refreshState() {
         ['Combats', String(s.fights.count)],
         ['Relevé le', fmt(s.troops.updatedAt)],
     ].map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('');
+    renderResBar();
     renderDashSummary();
     return s;
+}
+
+/* Barre de ressources, visible depuis n'importe quelle page. Les stocks conditionnent presque
+   toutes les décisions du jeu — recruter, construire, améliorer — donc ils ne doivent jamais
+   demander un détour par une autre vue. Un stock plein s'y signale : la production est perdue. */
+function renderResBar() {
+    const bar = $('#resbar');
+    const res = state.server?.hq?.resources;
+    if (!res?.length) { bar.hidden = true; return; }
+    bar.hidden = false;
+    const hq = state.server.hq;
+    bar.innerHTML = `
+        ${res.map((r) => `
+            <a class="rb-item${r.full ? ' is-full' : ''}" href="#qg"
+                title="${esc(r.fr)}${r.cap ? ` — ${num(r.value)} sur ${num(r.cap)}` : ''}${r.perTurn ? ` · +${num(r.perTurn)} par tour` : ''}${r.full ? ' — stock plein, la production est perdue' : ''}">
+                <img src="/assets/res/${esc(r.icon)}.webp" alt="${esc(r.fr)}" width="22" height="22"
+                    loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('b'),{className:'rb-fallback',textContent:'${esc(r.fr.slice(0, 1))}'}))">
+                <span class="rb-val">${num(r.value)}</span>
+                ${r.cap ? `<span class="rb-bar"><i style="width:${Math.min(100, r.pct || 0)}%"></i></span>` : ''}
+            </a>`).join('')}
+        <span class="rb-sep" aria-hidden="true"></span>
+        <a class="rb-item rb-meta" href="#qg" title="Niveau du personnage">
+            <span class="rb-key">niv.</span><span class="rb-val">${num(hq.level)}</span></a>
+        <a class="rb-item rb-meta" href="#qg" title="Classement">
+            <span class="rb-key">pts</span><span class="rb-val">${num(hq.rating)}</span></a>
+        ${hq.skillPoints ? `<a class="rb-item rb-alert" href="#qg"
+            title="Points de compétence non dépensés"><span class="rb-key">compétence</span>
+            <span class="rb-val">${num(hq.skillPoints)}</span></a>` : ''}
+        <span class="rb-when" title="Dernier relevé du QG">${hq.updatedAt ? esc(fmtDate(hq.updatedAt)) : ''}</span>`;
 }
 
 function renderDashSummary() {
@@ -151,6 +247,17 @@ function renderDashSummary() {
     if (!s) return;
     const warn = [];
     if (!s.fights.count) warn.push('Aucun combat en base : clique sur <strong>Mettre à jour</strong>.');
+    if (s.hq?.skillPoints) {
+        warn.push(`<strong>${s.hq.skillPoints} point(s) de compétence non dépensé(s)</strong> — `
+            + 'voir <a href="#qg">Le QG</a>.');
+    }
+    if (s.hq?.full?.length) {
+        warn.push(`Stock plein : <strong>${s.hq.full.join(', ')}</strong>. La production correspondante est perdue.`);
+    }
+    if (s.fights.count && !s.assets?.count) {
+        warn.push('Aucune image en local : les vignettes de troupes, icônes d’objets et photos de profil '
+            + 'manqueront dans l’interface. <strong>Mettre à jour</strong> les récupère.');
+    }
     else if (!s.troops.detailed) warn.push('Aucune fiche de troupe : <strong>Mettre à jour</strong> les relèvera.');
     if (s.enemies?.stale) {
         warn.push('Les fiches d’adversaires datent d’avant le dernier téléchargement de combats : '
@@ -166,6 +273,12 @@ function renderDashSummary() {
             ${tile('Adversaires suivis', s.enemies?.count ?? 0, `${s.enemies?.changes ?? 0} changements de troupes relevés`)}
             ${tile('Objets catalogués', s.items?.count ?? 0, 'armes, protections et porte-bonheur vus en combat')}
             ${tile('Fiches de troupes', `${s.troops.detailed}<small>/ ${s.troops.count}</small>`, 'chiffrées / relevées')}
+            ${tile('QG', s.hq?.level ? `niveau ${s.hq.level}` : '—', s.hq
+        ? `${s.hq.buildings} bâtiments · classement ${num(s.hq.rating)}${s.hq.skillPoints ? ` · ${s.hq.skillPoints} point(s) libre(s)` : ''}`
+        : 'lance « Mettre à jour »', { tone: s.hq?.skillPoints ? 'bad' : null })}
+            ${tile('Images en local', s.assets?.count ?? 0, s.assets?.counts
+        ? `${s.assets.counts.portrait ?? 0} portraits · ${s.assets.counts.vignette ?? 0} vignettes · ${s.assets.counts.avatar ?? 0} avatars`
+        : 'lance « Mettre à jour » pour les récupérer')}
         </div>
         ${resumeCard(s)}
         ${warn.length ? `<div class="stack" style="margin-top:1rem">${warn.map((w) => callout(w, 'bad')).join('')}</div>` : ''}`;
@@ -228,6 +341,7 @@ async function runAnalyse({ silent = false } = {}) {
     }
     state.analysis = res.analysis;
     state.backtest = res.backtest;
+    state.learned = res.learned || [];
     state.skills = res.skills || null;
     renderAnalyse();
     if (!silent) location.hash = 'analyse';
@@ -266,6 +380,28 @@ function renderAnalyse() {
 
         ${callout(diag, r.defense.winRate < 40 ? 'bad' : null)}
 
+        <h2 class="block">Les ${a.fights.length} combats</h2>
+        <p class="note">Clique sur une ligne pour ouvrir le <strong>journal du combat</strong>, tel que le
+            jeu l’a rédigé — avec les coups critiques et les unités mises KO, que le rapport JSON ne donne pas.</p>
+        ${dataTable(
+        ['Quand', 'Rôle', 'Issue', 'Adversaire', 'Niv.', 'Points', 'Ma compo', 'Mes PV au départ', 'Capacités actives'],
+        a.fights.map((f) => [
+            `<span style="color:var(--text-3)">${esc(when(f.at))}</span>`,
+            esc(f.role),
+            f.won ? '<span class="chip chip-on">Victoire</span>' : '<span class="chip chip-off">Défaite</span>',
+            `<span class="who">${avatarChip(f.opponent.avatar, f.opponent.name, { size: 'sm' })}
+                <span>${esc(f.opponent.name)}</span></span>`,
+            num(f.opponent.level),
+            `<span class="${f.delta >= 0 ? 'v-good' : 'v-bad'}">${f.delta >= 0 ? '+' : ''}${f.delta}</span>`,
+            f.myPiles.filter((p) => !p.reinforcement).map((p) => `${esc(p.base)}&nbsp;×${p.qty}`).join(', '),
+            pct(f.myPiles.reduce((s, p) => s + p.hp, 0) / (f.myPiles.reduce((s, p) => s + p.max, 0) || 1)),
+            f.abOn.length ? f.abOn.length : '<span class="v-bad">0</span>',
+        ]),
+        [0, 0, 0, 0, 1, 1, 0, 1, 1],
+        'wrap-6',
+        { rowLink: a.fights.map((f) => `#combat/${f.id}`) },
+    )}
+
         <h2 class="block">Capacités spéciales</h2>
         <p class="note">Une capacité n’agit que si le type engagé atteint <strong>10 % de tes places de troupes</strong>
             (${a.abilities.needMedian} unités en médiane sur cet historique). En dessous, elle ne fait rien — et la place
@@ -293,7 +429,7 @@ function renderAnalyse() {
         ${dataTable(
         ['Type', 'Rôle', 'Capacité', 'Niv. type', 'Combats', 'Qté méd.', 'Part des dégâts', 'Dégâts / unité', 'Subis / unité', 'Échange', 'Cap. active'],
         a.myTypes.map((t) => [
-            `<strong>${esc(t.fr)}</strong>`,
+            unitChip(t.key, t.fr),
             `<span class="chip chip-role">${esc(t.roleFr)}</span>`,
             esc(t.abilityFr || '—'),
             levelCell(t.typeLevel),
@@ -319,7 +455,7 @@ function renderAnalyse() {
         ${dataTable(
         ['Type adverse', 'Rôle', 'Capacité', 'Niv. type', 'Rencontré', 'Qté méd.', 'PV / unité', 'Dégâts / coup', 'Cadence', 'Bonus d’objets moyens', 'Pièces les plus portées', 'Renforts'],
         a.opponents.pool.map((o) => [
-            `<strong>${esc(o.key)}</strong>`,
+            unitChip(o.key, o.key),
             `<span class="chip chip-role">${esc(o.roleFr)}</span>`,
             esc(o.abilityFr || '—'),
             levelCell(o.typeLevel),
@@ -340,14 +476,24 @@ function renderAnalyse() {
 
         ${bt ? backtestCard(bt) : ''}
 
+        ${learnedCard(state.learned)}
+
         <h2 class="block">Ce que l’historique dit du moteur</h2>
+        <p class="note">Les mécaniques ci-dessous ne sont pas supposées : elles sont <strong>mesurées</strong>
+            dans les frises de coups et les journaux de tes combats, et c’est exactement ce que le
+            simulateur rejoue. La comptabilité (vivants, KO, boucliers, soins) tombe à l’unité près.</p>
         <div class="cards">
             ${[
         ['Formule de dégâts', a.mechanics.damageFormula],
+        ['Cadence de frappe', a.mechanics.timing],
+        ['Riposte', a.mechanics.counter],
+        ['Bouclier', a.mechanics.shield],
+        ['Coups critiques', a.mechanics.critMult],
+        ['Talents adverses', a.mechanics.opponentTalents],
         ['Triangle des rôles', a.mechanics.roleEffectOnDamage],
         ['Choix de la cible', a.mechanics.targeting],
         ['Durée d’un combat', `${a.mechanics.medianFightSeconds} s en médiane (le temps est compté en centièmes de seconde)`],
-    ].map(([h, p]) => `<div class="card"><h3>${esc(h)}</h3><p>${p}</p></div>`).join('')}
+    ].filter(([, p]) => p).map(([h, p]) => `<div class="card"><h3>${esc(h)}</h3><p>${p}</p></div>`).join('')}
             <div class="card">
                 <h3>Amplitudes des capacités</h3>
                 ${Object.entries(a.mechanics.abilityMagnitudes).map(([k, v]) => `<p><code>${esc(k)}</code> — ${esc(v)}</p>`).join('')}
@@ -359,32 +505,9 @@ function renderAnalyse() {
             </div>
         </div>
 
-        <h2 class="block">Les ${a.fights.length} combats</h2>
-        ${dataTable(
-        ['Quand', 'Rôle', 'Issue', 'Adversaire', 'Niv.', 'Points', 'Ma compo', 'Mes PV au départ', 'Capacités actives'],
-        a.fights.map((f) => [
-            `<span style="color:var(--text-3)">${esc(when(f.at))}</span>`,
-            esc(f.role),
-            f.won ? '<span class="chip chip-on">Victoire</span>' : '<span class="chip chip-off">Défaite</span>',
-            `<button type="button" class="link" data-goto-enemy="${f.opponent.id}">${esc(f.opponent.name)}</button>`,
-            num(f.opponent.level),
-            `<span class="${f.delta >= 0 ? 'v-good' : 'v-bad'}">${f.delta >= 0 ? '+' : ''}${f.delta}</span>`,
-            f.myPiles.filter((p) => !p.reinforcement).map((p) => `${esc(p.base)}&nbsp;×${p.qty}`).join(', '),
-            pct(f.myPiles.reduce((s, p) => s + p.hp, 0) / (f.myPiles.reduce((s, p) => s + p.max, 0) || 1)),
-            f.abOn.length ? f.abOn.length : '<span class="v-bad">0</span>',
-        ]),
-        [0, 0, 0, 0, 1, 1, 0, 1, 1],
-        'wrap-6',
-    )}`;
+        `;
 
-    // Depuis un combat, ouvrir directement la fiche de l'adversaire qu'on y a affronté.
-    for (const b of $$('[data-goto-enemy]', body)) {
-        b.addEventListener('click', async () => {
-            location.hash = 'adversaires';
-            if (!state.enemies) await loadEnemies();
-            await openEnemy(b.dataset.gotoEnemy);
-        });
-    }
+    wireRowLinks(body);
 }
 
 /* Les talents sont la troisième source de puissance, à côté du niveau de type et de l'équipement.
@@ -460,6 +583,33 @@ function readiness(a) {
     return xs.length ? xs[xs.length >> 1] : 1;
 }
 
+/* Les talents adverses, invisibles dans les stats servies, mais mesurés dans les journaux :
+   qui tape plus fort que sa carte, qui a le critique amélioré. C'est ce que le simulateur
+   applique quand il reconstruit une armée d'en face. */
+function learnedCard(learned) {
+    if (!learned?.length) return '';
+    return `
+        <h2 class="block">Talents adverses, mesurés</h2>
+        <p class="note">Les PV servis par le jeu contiennent l’équipement d’en face, mais <strong>pas ses
+            talents de dégâts</strong>. Le journal de combat, lui, les trahit : le rapport entre les dégâts
+            mesurés et ceux que sa carte explique est la signature de ses talents — stable d’un combat à
+            l’autre. <strong>×1,00</strong> = conforme à sa carte ; au-dessus, il tape plus fort qu’annoncé.
+            Le simulateur applique ces facteurs automatiquement.</p>
+        ${dataTable(
+        ['Adversaire', 'Facteur de dégâts', 'Critique', 'Détail par type'],
+        learned.map((o) => [
+            `<span class="who">${avatarChip(o.avatar, o.name, { size: 'sm' })}<span>${esc(o.name)}</span></span>`,
+            `<span class="${(o.factorMedian || 1) > 1.1 ? 'v-bad' : (o.factorMedian || 1) < 0.9 ? 'v-good' : ''}">
+                ×${String(o.factorMedian ?? '?').replace('.', ',')}</span>`,
+            o.critMult != null
+                ? (o.critMult >= 2 ? `<span class="chip chip-off">×2,0 — Executioner</span>` : '×1,5')
+                : '—',
+            o.types.map((t) => `${esc(t.base)} ×${String(t.factor ?? '?').replace('.', ',')}`).join(' · '),
+        ]),
+        [0, 1, 0, 0],
+    )}`;
+}
+
 function backtestCard(bt) {
     const b = bt.balanced;
     const rows = ['attaque', 'défense'].map((role) => {
@@ -478,7 +628,11 @@ function backtestCard(bt) {
                     d’avant-combat et retrouve le bon vainqueur <strong>${bt.correct} fois</strong>
                     (${bt.accuracy} %). Prédire « défaite » à tous les coups donnerait ${bt.baseline} %,
                     donc la comparaison à retenir est le pouvoir de classement : <strong>${bt.separation}</strong>
-                    (1 = parfait, 0,5 = hasard).</p>
+                    (1 = parfait, 0,5 = hasard)${bt.brier != null ? ` — et la qualité des probabilités,
+                    score de Brier <strong>${String(bt.brier).replace('.', ',')}</strong>
+                    (0 = parfait, 0,25 = pile ou face)` : ''}.
+                    Chaque mesure apprise sur un adversaire est exclue du combat qu’elle sert à rejouer
+                    (leave-one-out) : le score n’est pas gonflé par l’auto-apprentissage.</p>
                 ${rows}
                 <p class="note">Le seuil de bascule est calé sur l’historique
                     (${Object.entries(bt.threshold).map(([k, v]) => `${k} ${v > 0 ? '+' : ''}${v}`).join(', ')}) :
@@ -547,11 +701,15 @@ function renderEnemies() {
             d’équipement de chaque pile. Rien n’est deviné, et aucune requête supplémentaire n’est faite
             au jeu. Clique sur une ligne pour voir l’armée actuelle et l’historique de ses changements.`)}
 
+        <h2 class="block">Chercher un adversaire</h2>
+        <div class="enemy-search"><div id="enemy-picker"></div></div>
+
         <h2 class="block">Les ${res.players.length} adversaires</h2>
         ${dataTable(
         ['Adversaire', 'Niv.', 'Classement', 'Combats', 'Mon bilan', 'Fortif.', 'Armée connue', 'Types engagés', 'Changements', 'Vu pour la dernière fois'],
         res.players.map((p) => [
-            `<button type="button" class="link" data-enemy="${p.id}">${esc(p.name)}</button>`,
+            `<span class="who">${avatarChip(p.avatar, p.name, { size: 'sm' })}
+                <strong>${esc(p.name)}</strong></span>`,
             p.level.last === p.level.first ? num(p.level.last) : `${num(p.level.first)} → ${num(p.level.last)}`,
             p.rating.last != null ? num(p.rating.last) : '—',
             num(p.record.fights),
@@ -564,28 +722,49 @@ function renderEnemies() {
         ]),
         [0, 1, 1, 1, 0, 1, 0, 0, 1, 0],
         'wrap-7',
-    )}
+        { rowLink: res.players.map((p) => `#adversaire/${p.id}`) },
+    )}`;
 
-        <div id="enemy-detail"></div>`;
+    wireRowLinks(box);
 
-    for (const b of $$('[data-enemy]', box)) {
-        b.addEventListener('click', () => openEnemy(b.dataset.enemy));
-    }
+    /* Même sélecteur que dans le simulateur : on parcourt ou on tape, et la fiche s'ouvre. */
+    picker($('#enemy-picker', box), {
+        items: res.players.map((p) => ({
+            value: String(p.id),
+            name: p.name,
+            avatar: p.avatar,
+            label: `<strong>${esc(p.name)}</strong> <span style="color:var(--text-3)">niv. ${num(p.level.last)}</span>`,
+            sub: `${p.record.fights} combat(s) · ${p.record.myWins}V / ${p.record.myLosses}D`
+                + `${p.changes ? ` · ${p.changes} changement(s) de troupes` : ''}`,
+            search: `${p.name} ${(p.aka || []).join(' ')} `
+                + (p.latest ? p.latest.piles.map((x) => x.fr).join(' ') : ''),
+        })),
+        placeholder: 'Nom d’adversaire, ou type de troupe qu’il aligne…',
+        onPick: (id) => { location.hash = `adversaire/${id}`; },
+        empty: 'Aucun adversaire de ce nom dans ton historique.',
+    });
 }
 
 async function openEnemy(id) {
-    const host = $('#enemy-detail');
+    const host = $('#adversaire-body');
+    if (!/^\d+$/.test(String(id || ''))) {
+        host.innerHTML = `${backLink('adversaires', 'Tous les adversaires')}
+            ${callout('Adversaire inconnu.', 'bad')}`;
+        wireBack(host);
+        return;
+    }
     host.innerHTML = '<p class="empty">Chargement…</p>';
     let res;
     try {
         res = await api(`/api/enemy?id=${encodeURIComponent(id)}`);
     } catch (e) {
-        host.innerHTML = callout(e.message, 'bad');
+        host.innerHTML = `${backLink('adversaires', 'Tous les adversaires')}${callout(e.message, 'bad')}`;
+        wireBack(host);
         return;
     }
     state.enemy = res.player;
     renderEnemy(host, res.player);
-    host.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    wireBack(host);
 }
 
 function renderEnemy(host, p) {
@@ -593,7 +772,9 @@ function renderEnemy(host, p) {
     const changes = p.changes.slice().reverse(); // du plus récent au plus ancien
 
     host.innerHTML = `
-        <h2 class="block">${esc(p.name)}${p.aka.length > 1 ? ` <small>alias ${p.aka.map(esc).join(', ')}</small>` : ''}</h2>
+        ${backLink('adversaires', 'Tous les adversaires')}
+        <h2 class="block enemy-title">${avatarChip(p.avatar, p.name, { size: 'lg' })}
+            <span>${esc(p.name)}${p.aka.length > 1 ? ` <small>alias ${p.aka.map(esc).join(', ')}</small>` : ''}</span></h2>
         <div class="tiles">
             ${tile('Niveau', p.level.last, p.level.history.length > 1
         ? `${p.level.first} → ${p.level.last} sur la période`
@@ -614,7 +795,7 @@ function renderEnemy(host, p) {
             ${dataTable(
         ['Type', 'Rôle', 'Capacité', 'Quantité', 'PV / unité', 'Niv. type', 'Cadence mesurée', 'Arme', 'Protection', 'Porte-bonheur', 'Bonus d’objets'],
         latest.piles.map((x) => [
-            `<strong>${esc(x.fr)}</strong>`,
+            unitChip(x.base, x.fr),
             `<span class="chip chip-role">${esc(x.roleFr || '?')}</span>`,
             esc(x.abilityFr || '—'),
             num(x.qty),
@@ -667,7 +848,8 @@ function gearCell(g) {
     const bonus = Object.entries(g.affixes || {})
         .map(([k, v]) => `${v > 0 ? '+' : ''}${String(v).replace('.', ',')}${AFFIX_UNIT[k] || ''} ${AFFIX_FR[k] || k}`);
     return `<span class="item r-${g.rarity ?? 0}" title="${esc(g.rarityFr || '')}">
-        <b>${esc(g.name)}</b>${bonus.length ? `<small>${esc(bonus.join(' · '))}</small>` : ''}</span>`;
+        ${itemIcon(g.item, g.rarity)}
+        <span class="item-txt"><b>${esc(g.name)}</b>${bonus.length ? `<small>${esc(bonus.join(' · '))}</small>` : ''}</span></span>`;
 }
 
 function bonusCell(b) {
@@ -689,6 +871,523 @@ function mergeHistory(levels, ratings) {
         by.set(x.at, row);
     }
     return [...by.values()].sort((a, b) => b.at - a.at);
+}
+
+/* ── Images du jeu ─────────────────────────────────────────────────────────── */
+
+/* Les images sont copiées en local par `npm run assets` et servies sous /assets/. On ne pointe
+   jamais vers le site du jeu depuis la page : l'interface doit rester lisible hors ligne, et une
+   image manquante ne doit pas laisser d'icône cassée — d'où le repli sur `onerror`. */
+
+const unitFace = (key) => `/assets/units/face/${encodeURIComponent(key)}.webp`;
+const unitPortrait = (key) => `/assets/units/${encodeURIComponent(key)}.webp`;
+/** Les avatars portent un condensat dans leur nom : on ne garde que le fichier. */
+const avatarFile = (url) => (url ? String(url).split('?')[0].split('/').filter(Boolean).pop() : null);
+
+/** Vignette d'un type, suivie de son nom. L'unité de base de presque tous les tableaux. */
+function unitChip(key, label, { size = '' } = {}) {
+    return `<span class="u ${size}">
+        <img class="u-face" src="${unitFace(key)}" alt="" width="32" height="32" loading="lazy"
+            onerror="this.closest('.u').classList.add('no-img')">
+        <b>${esc(label ?? key)}</b></span>`;
+}
+
+/* Photo de profil. Quand elle manque — joueur jamais croisé en combat, images pas encore
+   téléchargées — on retombe sur l'initiale, qui reste identifiable dans une liste. */
+function avatarChip(url, name, { size = '' } = {}) {
+    const file = avatarFile(url);
+    const initial = esc((name || '?').trim().charAt(0).toUpperCase());
+    return `<span class="ava ${size}" data-initial="${initial}">
+        ${file ? `<img src="/assets/avatars/${encodeURIComponent(file)}" alt="" width="40" height="40" loading="lazy"
+            onerror="this.remove()">` : ''}</span>`;
+}
+
+/** Icône d'un objet, teintée par sa rareté. Le sprite est monochrome (`fill: currentColor`). */
+function itemIcon(item, rarity) {
+    if (!item) return '';
+    return `<svg class="item-ico r-${rarity ?? 0}" aria-hidden="true" focusable="false">
+        <use href="/assets/icons.svg#item-${esc(item)}"/></svg>`;
+}
+
+
+/* ── Recherche ─────────────────────────────────────────────────────────────── */
+
+/* Partout où il y a une liste de joueurs, on doit pouvoir soit parcourir, soit taper un nom.
+   Un `<select>` ne sait faire que parcourir, et il devient inutilisable dès qu'il y a 60 entrées.
+   D'où ce sélecteur : un champ qui filtre, une liste qui se réduit, le clavier qui marche. */
+
+/** Normalise pour comparer : sans accents, sans casse. « Chengríha » doit sortir sur « chengri ». */
+const fold = (s) => String(s ?? '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+
+/** Vrai si tous les mots de la requête se retrouvent dans le texte. */
+function matches(haystack, query) {
+    const h = fold(haystack);
+    return fold(query).split(/\s+/).filter(Boolean).every((w) => h.includes(w));
+}
+
+/**
+ * Sélecteur filtrable.
+ * @param items  [{ value, label, sub, avatar, name, search }]
+ * @param onPick appelée avec la valeur choisie
+ */
+function picker(host, { items, value, placeholder, onPick, empty = 'Aucun résultat.' }) {
+    host.innerHTML = `
+        <div class="picker">
+            <input type="search" class="picker-input" placeholder="${esc(placeholder)}"
+                autocomplete="off" aria-label="${esc(placeholder)}">
+            <ol class="picker-list" role="listbox"></ol>
+        </div>`;
+    const input = $('.picker-input', host);
+    const list = $('.picker-list', host);
+    let cursor = 0;
+
+    const visible = () => items.filter((it) => !input.value.trim() || matches(it.search || it.label, input.value));
+
+    const draw = () => {
+        const xs = visible();
+        cursor = Math.max(0, Math.min(cursor, xs.length - 1));
+        list.innerHTML = xs.length
+            ? xs.map((it, i) => `<li role="option" data-value="${esc(it.value)}"
+                class="${it.value === String(value) ? 'is-current' : ''}${i === cursor ? ' is-cursor' : ''}"
+                aria-selected="${it.value === String(value)}">
+                ${it.avatar !== undefined ? avatarChip(it.avatar, it.name || it.label, { size: 'sm' }) : ''}
+                <span class="picker-main">${it.label}</span>
+                ${it.sub ? `<span class="picker-sub">${it.sub}</span>` : ''}
+            </li>`).join('')
+            : `<li class="picker-none">${esc(empty)}</li>`;
+        const cur = $('.is-cursor', list);
+        if (cur) cur.scrollIntoView({ block: 'nearest' });
+    };
+
+    const pick = (v) => { if (v != null) onPick(v); };
+
+    input.addEventListener('input', () => { cursor = 0; draw(); });
+    input.addEventListener('keydown', (e) => {
+        const xs = visible();
+        if (e.key === 'ArrowDown') { cursor = Math.min(cursor + 1, xs.length - 1); draw(); e.preventDefault(); }
+        else if (e.key === 'ArrowUp') { cursor = Math.max(cursor - 1, 0); draw(); e.preventDefault(); }
+        else if (e.key === 'Enter') { pick(xs[cursor]?.value); e.preventDefault(); }
+        else if (e.key === 'Escape') { input.value = ''; cursor = 0; draw(); }
+    });
+    list.addEventListener('click', (e) => {
+        const li = e.target.closest('[data-value]');
+        if (li) pick(li.dataset.value);
+    });
+
+    draw();
+    return { focus: () => input.focus(), input };
+}
+
+/* ── Le quartier général ───────────────────────────────────────────────────── */
+
+async function loadHq() {
+    const box = $('#qg-body');
+    const res = await api('/api/hq');
+    if (res.empty) { box.innerHTML = callout(res.reason, 'bad'); return; }
+    state.hq = res;
+    renderHq();
+}
+
+function renderHq() {
+    const h = state.hq;
+    const box = $('#qg-body');
+    const lv = h.level;
+    const works = h.buildings.filter((b) => b.works);
+    const full = h.resources.filter((r) => r.full);
+
+    box.innerHTML = `
+        <div class="tiles">
+            ${tile('Niveau', lv.level, `${num(lv.xp)} / ${num(lv.xpTo)} XP · il reste ${num(lv.xpLeft)}`,
+        { hero: true, meter: lv.pct })}
+            ${tile('Points de compétence', h.skillPoints, h.skillPoints ? 'à dépenser' : 'tous dépensés',
+        { tone: h.skillPoints ? 'bad' : 'good' })}
+            ${tile('Classement', num(h.rating), `rang ${h.rank.city ?? '?'} dans la ville`)}
+            ${tile('Bâtiments', h.summary.total, `${h.summary.levels} niveaux cumulés · ${h.summary.atMax} au maximum`)}
+            ${tile('Attaques', h.attacks ? `${h.attacks.used}<small>/ ${h.attacks.max}</small>` : '—', 'utilisées sur la période')}
+        </div>
+
+        ${h.skillPoints ? callout(`<strong>${h.skillPoints} point(s) de compétence non dépensé(s).</strong>
+            Chaque niveau en donne un ; les laisser dormir, c’est de la puissance qui ne sert pas.`, 'bad') : ''}
+
+        <h2 class="block">Ressources</h2>
+        <div class="res-grid">
+            ${h.resources.filter((r) => r.value != null).map(resCard).join('')}
+        </div>
+        ${full.length ? callout(`<strong>${full.map((r) => r.fr).join(', ')} au plafond.</strong>
+            Toute production supplémentaire est perdue : dépense, ou monte la capacité de stockage.`, 'bad')
+        : `<p class="note">Un tour dure ${h.turn?.every ? h.turn.every / 60 : '?'} minutes ; la production ci-dessus est par tour.</p>`}
+
+        ${works.length ? `
+            <h2 class="block">Chantiers en cours</h2>
+            <div class="cards">
+                ${works.map((b) => `<div class="card work-card">
+                    <img class="bld-img" src="/assets/buildings/${esc(b.sprite)}.webp" alt="" loading="lazy"
+                        onerror="this.src='/assets/buildings/${esc(b.type)}.webp'; this.onerror=() => this.remove()">
+                    <div>
+                        <h3>${esc(b.name)}</h3>
+                        <p>Niveau ${b.level}${b.works.becomes ? ` → <strong>${esc(b.works.becomes)}</strong>` : ''}</p>
+                        <p class="note">Fin dans ${esc(hoursLeft(b.works.secondsLeft))}</p>
+                    </div>
+                </div>`).join('')}
+            </div>` : ''}
+
+        <h2 class="block">La ville</h2>
+        <p class="note">Rayon ${h.city.radius} / ${h.city.maxRadius} · ${num(h.city.areaM2)} m² ·
+            ${h.city.buildingSlots} emplacements de construction ·
+            milice niveau ${h.city.militia.level ?? '?'} (${num(h.city.militia.troops)} troupes).
+            Structures : ${num(h.summary.hp)} PV au total.</p>
+        <div class="bld-grid">
+            ${h.summary.byType.map((t) => buildingCard(t, h)).join('')}
+        </div>
+
+        <h2 class="block">Exporter pour un agent IA</h2>
+        ${callout(`Un compte rendu Markdown complet — QG, ressources, bâtiments, troupes, talents, objets,
+            bilan de combat et compositions — prêt à coller dans une conversation avec un agent IA pour lui
+            demander quoi améliorer. Les faits mesurés y sont séparés de ce qui est modélisé, et les limites
+            connues sont écrites noir sur blanc.`)}
+        <div class="controls" style="margin-top:.8rem">
+            <a class="btn" href="/api/report.md" download="sss-rapport.md">Télécharger le Markdown</a>
+            <button class="btn btn-ghost" type="button" data-copy-report>Copier dans le presse-papier</button>
+            <a class="btn btn-ghost" href="/api/report.md" target="_blank" rel="noreferrer">Ouvrir dans un onglet</a>
+        </div>
+        <p class="note" id="copy-note"></p>
+
+        ${h.history.length > 1 ? `
+            <h2 class="block">Progression</h2>
+            ${dataTable(['Quand', 'Niveau', 'Classement', 'Points libres', 'Bâtiments', 'Niveaux cumulés'],
+        h.history.slice().reverse().slice(0, 20).map((p) => [
+            `<span style="color:var(--text-3)">${esc(fmtDate(p.at))}</span>`,
+            num(p.level), num(p.rating), num(p.skillPoints), num(p.buildings), num(p.buildingLevels),
+        ]), [0, 1, 1, 1, 1, 1])}` : ''}`;
+
+    wireCopyReport();
+}
+
+function resCard(r) {
+    return `<div class="res-card${r.full ? ' is-full' : ''}">
+        <img class="res-img" src="/assets/res/${esc(r.icon)}.webp" alt="" width="28" height="28" loading="lazy"
+            onerror="this.remove()">
+        <div class="res-main">
+            <span class="res-name">${esc(r.fr)}</span>
+            <strong class="res-value">${num(r.value)}</strong>
+            ${r.cap != null ? `<span class="res-cap">/ ${num(r.cap)}</span>` : ''}
+        </div>
+        ${r.cap != null ? `<span class="meter${r.full ? ' is-bad' : ''}"><i style="width:${Math.min(100, r.pct)}%"></i></span>` : ''}
+        <span class="res-prod">${r.perTurn != null ? `+${num(r.perTurn)} / tour` : '—'}</span>
+    </div>`;
+}
+
+function buildingCard(t, h) {
+    const sample = h.buildings.find((b) => b.type === t.type && b.level === t.max) || h.buildings.find((b) => b.type === t.type);
+    return `<div class="bld-card">
+        <img class="bld-img" src="/assets/buildings/${esc(sample?.sprite || t.type)}.webp" alt="" loading="lazy"
+            onerror="this.src='/assets/buildings/${esc(t.type)}.webp'; this.onerror=() => this.remove()">
+        <div class="bld-body">
+            <strong>${esc(t.name)}</strong>
+            <span class="bld-lv">niv. ${t.max}${t.count > 1 ? ` · ×${t.count}` : ''}${t.atMax ? ' · au max' : ''}</span>
+            <small>${esc((t.role || '').replace(/^[^—]*— /, ''))}</small>
+        </div>
+    </div>`;
+}
+
+function hoursLeft(seconds) {
+    if (!Number.isFinite(seconds)) return '?';
+    const hrs = Math.floor(seconds / 3600);
+    const min = Math.round((seconds % 3600) / 60);
+    return hrs ? `${hrs} h ${String(min).padStart(2, '0')}` : `${min} min`;
+}
+
+/* Le presse-papier est le chemin le plus court vers une conversation avec un agent : pas de
+   fichier à retrouver, on colle directement. */
+function wireCopyReport() {
+    const btn = $('[data-copy-report]');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+        const note = $('#copy-note');
+        btn.disabled = true;
+        btn.textContent = 'Génération…';
+        try {
+            const md = await (await fetch('/api/report.md')).text();
+            await navigator.clipboard.writeText(md);
+            note.innerHTML = `<span class="v-good">Copié — ${num(md.length)} caractères, ${num(md.split('\n').length)} lignes.</span>`;
+        } catch (e) {
+            note.innerHTML = `<span class="v-bad">Copie impossible (${esc(e.message)}). Utilise le téléchargement.</span>`;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Copier dans le presse-papier';
+        }
+    });
+}
+
+/* ── Le journal d'un combat ────────────────────────────────────────────────── */
+
+/* Le déroulé réel, tel que le jeu l'a rédigé. Il porte deux choses que le rapport JSON ne donne
+   pas : quels coups ont été critiques, et combien d'unités chaque coup a mises KO. */
+
+async function openFight(id) {
+    const host = $('#combat-body');
+    if (!/^\d+$/.test(String(id || ''))) {
+        host.innerHTML = `${backLink('analyse', 'Tous les combats')}${callout('Combat inconnu.', 'bad')}`;
+        wireBack(host);
+        return;
+    }
+    host.innerHTML = '<p class="empty">Chargement du journal…</p>';
+    let res;
+    try {
+        res = await api(`/api/fight?id=${encodeURIComponent(id)}`);
+    } catch (e) {
+        host.innerHTML = `${backLink('analyse', 'Tous les combats')}${callout(e.message, 'bad')}`;
+        wireBack(host);
+        return;
+    }
+    renderFight(host, res);
+    wireBack(host);
+    wireBestCompo(host);
+    wireCopyMd(host);
+}
+
+/* ── Export Markdown pour un agent IA ──────────────────────────────────────── */
+
+/* Copier, c'est le geste courant : on colle dans une conversation et on demande conseil.
+   Le téléchargement est à côté pour archiver ou joindre. */
+function wireCopyMd(host) {
+    for (const btn of $$('[data-copy-md]', host)) {
+        btn.addEventListener('click', async () => {
+            const note = btn.closest('.export-row')?.querySelector('[data-copy-note]');
+            btn.disabled = true;
+            try {
+                const md = await (await fetch(btn.dataset.copyMd)).text();
+                await navigator.clipboard.writeText(md);
+                if (note) note.innerHTML = `<span class="v-good">Copié — ${num(md.length)} caractères.</span>`;
+            } catch (e) {
+                if (note) note.innerHTML = `<span class="v-bad">Copie impossible (${esc(e.message)}).</span>`;
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    }
+}
+
+/** Télécharge un texte comme fichier .md, sans rien demander au serveur. */
+function downloadMd(name, text) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/markdown' }));
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+/* ── La meilleure composition contre CE combat ─────────────────────────────── */
+
+function wireBestCompo(host) {
+    const btn = $('[data-bestco]', host);
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+        const out = $('#bestco-result', host);
+        btn.disabled = true;
+        btn.textContent = 'Recherche en cours…';
+        try {
+            const r = await api('/api/best-compo', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fightId: Number(btn.dataset.bestco) }),
+            });
+            out.innerHTML = renderBestCompo(r);
+            wireTryButtons(out);
+        } catch (e) {
+            out.innerHTML = callout(e.message, 'bad');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Trouver la meilleure composition';
+        }
+    });
+}
+
+function renderBestCompo(r) {
+    const fmt = (x) => String(x ?? '?').replace('.', ',');
+    const top = r.best[0] || null;
+    const winnable = top && top.pWin >= 50;
+    const closeCall = top && top.pWin >= 25 && top.pWin < 50;
+
+    const compoCard = (b, label, { highlight = false } = {}) => `
+        <article class="compo${highlight ? ' is-best' : ''}">
+            <div class="compo-rank">${esc(label)}</div>
+            <div class="compo-mix">
+                ${b.types.map((t) => `
+                    <span class="unit ${t.abilityOn === false ? 'is-off' : ''}">
+                        <img class="u-face" src="${unitFace(t.key)}" alt="" width="32" height="32" loading="lazy"
+                            onerror="this.remove()">
+                        <b>${esc(t.fr)}</b><span class="qty">×${num(t.qty)}</span>
+                        ${t.abilityFr != null ? `<span class="ab">${t.abilityOn ? esc(t.abilityFr || '') : 'capacité éteinte'}</span>` : ''}
+                    </span>`).join('')}
+            </div>
+            <div class="compo-score">
+                ${b.pWin != null ? `<b class="${b.pWin >= 50 ? 'v-good' : 'v-bad'}">${fmt(b.pWin)} %</b>
+                <span>de victoires sur ce combat</span>` : ''}
+                ${b.margin != null ? `<span>marge ${b.margin > 0 ? '+' : ''}${fmt(b.margin)}</span>` : ''}
+            </div>
+            <div class="compo-meta">
+                <button type="button" class="link"
+                    data-try='${esc(JSON.stringify(b.types.map((t) => ({ key: t.key, qty: t.qty }))))}'
+                    data-try-fight="${r.fightId}" data-try-run="1">Simuler ce duel maintenant →</button>
+                ${b.slotsUsed ? `<span>${num(b.slotsUsed)} places</span>` : ''}
+                ${b.abilitiesOn?.length ? `<span>${b.abilitiesOn.length} capacité(s) : ${esc(b.abilitiesOn.join(', '))}</span>` : ''}
+            </div>
+        </article>`;
+
+    const verdictText = winnable
+        ? `<strong>Ce combat était gagnable.</strong> La meilleure composition trouvée le gagne
+           <strong>${fmt(top.pWin)} %</strong> du temps (${num(r.runs)} tirages réels par finaliste).`
+        : closeCall
+            ? `<strong>Jouable, mais serré.</strong> Même la meilleure composition ne dépasse pas
+               <strong>${fmt(top.pWin)} %</strong> de victoires : l’issue resterait au tirage.`
+            : `<strong>Aucune composition ne gagne ce combat</strong> tel qu’il s’est présenté — la
+               meilleure trouvée plafonne à <strong>${fmt(top?.pWin)} %</strong>${r.role === 'défense' && r.readiness < 0.99
+                ? `, avec tes troupes à ${Math.round(r.readiness * 100)} % de leurs PV. Le problème
+                   n’était pas la composition.` : '.'}`;
+
+    return `
+        ${callout(`${verdictText}
+            <span style="color:var(--text-3)">Recherche : ${num(r.screened)} compositions sur
+            ${num(r.slots)} places et ${r.maxTypes} types, ${esc(r.role)}${r.fort ? ` · fort ${r.fort} %` : ''}${r.foeFort ? ` · ses murs ${r.foeFort} %` : ''}${r.role === 'défense' ? ` · forme ${Math.round(r.readiness * 100)} %` : ''}.
+            Ce jour-là : ${r.actual.won ? 'victoire' : 'défaite'}.</span>`,
+        winnable ? 'good' : closeCall ? null : 'bad')}
+
+        ${r.best.map((b, i) => compoCard(b, `0${i + 1}`.slice(-2), { highlight: i === 0 })).join('')}
+
+        ${r.historic ? compoCard({ ...r.historic, abilitiesOn: null }, 'ce jour-là') : ''}
+        ${r.current ? compoCard(r.current, 'actuelle') : ''}
+
+        ${r.healed && (!top || r.healed.pWin > top.pWin) ? callout(`<strong>Avec des troupes soignées</strong>
+            (100 % au lieu de ${Math.round(r.readiness * 100)} %), la meilleure composition gagnerait
+            <strong>${fmt(r.healed.pWin)} %</strong> du temps :
+            ${r.healed.types.map((t) => `${esc(t.fr)} ×${num(t.qty)}`).join(' + ')}.
+            Le levier était la récupération, pas la composition.`, 'good') : ''}`;
+}
+
+function renderFight(host, res) {
+    const f = res.fight;
+    const log = res.log;
+    const me = f?.role === 'attaque' ? 'att' : 'def';
+
+    host.innerHTML = `
+        ${backLink('analyse', 'Tous les combats')}
+        <header class="view-head">
+            <p class="kicker">Journal de combat</p>
+            <h1>${f ? esc(f.opponent.name) : `Combat ${res.id}`}</h1>
+            ${f ? `<p class="lede">${esc(f.role)} · ${esc(when(f.at))} · combat ${res.id}
+                ${f.opponent.id ? `· <a href="#adversaire/${f.opponent.id}">voir sa fiche</a>` : ''}</p>` : ''}
+        </header>
+        ${f ? `
+            <div class="verdict ${f.won ? 'is-win' : 'is-loss'}">
+                <div class="verdict-main">
+                    <span class="verdict-label">${f.won ? 'Victoire' : 'Défaite'}</span>
+                    <span class="verdict-sub">${esc(f.role)} contre ${esc(f.opponent.name)} · ${esc(when(f.at))}</span>
+                </div>
+                <dl class="verdict-stats">
+                    <div><dt>Durée</dt><dd>${String(f.seconds).replace('.', ',')} s</dd></div>
+                    <div><dt>Points</dt><dd class="${f.delta >= 0 ? 'v-good' : 'v-bad'}">${f.delta >= 0 ? '+' : ''}${f.delta}</dd></div>
+                    ${log ? `<div><dt>Coups</dt><dd>${num(log.counts.hits)}</dd></div>
+                    <div><dt>Critiques</dt><dd>${num(log.counts.crits)}</dd></div>
+                    <div><dt>Unités KO</dt><dd>${num(log.counts.ko)}</dd></div>` : ''}
+                </dl>
+            </div>
+
+            <h3 class="block">Les deux armées</h3>
+            ${dataTable(['Camp', 'Type', 'Quantité', 'Capacité', 'Dégâts infligés', 'Dégâts subis', 'PV au départ', 'PV à la fin'],
+        [...f.myPiles.map((p) => ({ ...p, mine: true })), ...f.theirPiles.map((p) => ({ ...p, mine: false }))]
+            .map((p) => [
+                p.mine ? '<span class="chip chip-on">moi</span>'
+                    : `<span class="chip chip-off">${esc(f.opponent.name)}</span>`,
+                unitChip(p.base, p.base) + (p.reinforcement ? ' <small style="color:var(--text-3)">renfort</small>' : ''),
+                num(p.qty),
+                p.ability
+                    ? ((p.mine ? f.abOn : f.abOnTheirs).includes(p.ability)
+                        ? `<span class="chip chip-on">${esc(ABILITY_FR_UI[p.ability] || p.ability)}</span>`
+                        : `<span class="chip chip-off">${esc(ABILITY_FR_UI[p.ability] || p.ability)} éteinte</span>`)
+                    : '—',
+                num(p.dealt), num(p.taken),
+                `<span class="${p.hp / (p.max || 1) >= 0.99 ? '' : 'v-bad'}">${pct(p.hp / (p.max || 1))}</span>`,
+                hpLeftCell(p),
+            ]), [0, 0, 1, 0, 1, 1, 1, 1])}
+        ` : ''}
+
+        <p class="note">« PV au départ » n’est pas toujours 100 % : en défense, une pile qui n’a pas fini
+            de récupérer encaisse l’attaque amoindrie. « PV à la fin » est ce qu’il en restait.</p>
+
+        ${f ? `
+            <div class="export-row">
+                <button type="button" class="btn" data-copy-md="/api/fight.md?id=${res.id}">Copier pour un agent IA</button>
+                <a class="btn" href="/api/fight.md?id=${res.id}" download="sss-combat-${res.id}.md">Télécharger .md</a>
+                <span class="note" style="margin:0">Tout le combat en Markdown — armées, équipement, journal
+                    coup par coup, avis du simulateur — prêt à coller dans une conversation avec un agent IA
+                    pour lui demander pourquoi, et quoi changer.</span>
+                <span data-copy-note></span>
+            </div>
+
+            <h3 class="block">Gagner ce combat</h3>
+            <div id="bestco">
+                <p class="note">Cherche la composition qui a le plus de chances de gagner <strong>ce
+                    combat précis</strong> — même adversaire, mêmes fortifications${f.role === 'défense'
+        ? ', et tes troupes dans l’état où elles étaient ce jour-là' : ''}. Toutes les combinaisons
+                    de types sont passées en revue, puis les finalistes sont départagés au Monte-Carlo
+                    (vrais tirages).</p>
+                <button class="btn" data-bestco="${res.id}">Trouver la meilleure composition</button>
+                <div id="bestco-result"></div>
+            </div>` : ''}
+
+        ${log ? `
+            <h3 class="block">Le journal, coup par coup</h3>
+            <p class="note">Rédigé par le jeu lui-même (<code>view/fightlog</code>), pas reconstruit : c’est la
+                seule source qui dise quels coups ont été <strong>critiques</strong> et combien d’unités chaque
+                coup a mises <strong>KO</strong>. ${num(log.counts.lines)} lignes,
+                ${num(log.counts.crits)} critiques sur ${num(log.counts.hits)} coups
+                (${Math.round((100 * log.counts.crits) / (log.counts.hits || 1))} %),
+                ${num(log.counts.ripostes)} ripostes.</p>
+            <ol class="fightlog">${log.lines.map((l) => logLine(l, me, f)).join('')}</ol>
+        ` : callout(`Le journal de ce combat n’a pas encore été récupéré. Il arrive au prochain
+            <strong>Mettre à jour</strong> — ils sont rattrapés par lots, du plus récent au plus ancien.`)}`;
+}
+
+/* Ce qu'il restait à la pile à la fin du combat. `end` est servi par le serveur ; sans lui on
+   n'affiche rien plutôt qu'un chiffre faux. */
+function hpLeftCell(p) {
+    if (p.end == null) return '—';
+    const left = p.end / (p.max || 1);
+    return `<span class="${left > 0.3 ? 'v-good' : 'v-bad'}">${pct(left)}</span>`;
+}
+
+function logLine(l, me, f) {
+    const mine = l.side === me;
+    const who = mine ? 'moi' : (f ? f.opponent.name : 'adversaire');
+    const t = `<span class="lg-t">${(l.t / 100).toFixed(2).replace('.', ',')} s</span>`;
+
+    if (l.kind === 'end') {
+        return `<li class="lg-end">${t}<span class="lg-body">${esc(l.text)}</span></li>`;
+    }
+    if (l.kind === 'ability') {
+        return `<li class="lg-ab ${mine ? 'is-mine' : 'is-theirs'}">${t}
+            <span class="lg-body"><strong>${esc(l.text)}</strong></span></li>`;
+    }
+    if (l.kind !== 'hit') {
+        return `<li class="${mine ? 'is-mine' : 'is-theirs'}">${t}<span class="lg-body">${esc(l.text || '')}</span></li>`;
+    }
+    return `<li class="${mine ? 'is-mine' : 'is-theirs'}${l.crit ? ' is-crit' : ''}${l.riposte ? ' is-rip' : ''}">
+        ${t}
+        <span class="lg-body">
+            <span class="lg-who">${esc(who)}</span>
+            ${unitChip(l.from, l.from, { size: 'sm' })}
+            ${l.fromQty ? `<small class="lg-n">×${num(l.fromQty)}</small>` : ''}
+            <span class="lg-verb">${l.riposte ? 'riposte sur' : 'frappe'}</span>
+            ${unitChip(l.to, l.to, { size: 'sm' })}
+            ${l.toQty ? `<small class="lg-n">×${num(l.toQty)}</small>` : ''}
+        </span>
+        <span class="lg-dmg">${l.dmg ? num(l.dmg)
+        : '<span class="lg-absorbed" title="coup entièrement encaissé par un bouclier">absorbé</span>'}</span>
+        ${l.crit ? '<span class="lg-crit">critique</span>' : ''}
+        ${l.ko ? `<span class="lg-ko">${num(l.ko)} KO</span>` : ''}
+        ${l.heal ? `<span class="lg-heal">+${num(l.heal)}</span>` : ''}
+    </li>`;
 }
 
 /* ── Simulateur ────────────────────────────────────────────────────────────── */
@@ -734,6 +1433,12 @@ const currentScenario = () => simu.scenarios.find((s) => s.fightId === simu.figh
 const simuUsed = () => [...simu.piles.values()].reduce((a, n) => a + n, 0);
 const simuTypes = () => [...simu.piles.values()].filter((n) => n > 0).length;
 
+/* Place maximale qu'un type peut prendre, le reste de la composition étant figé. Les places de
+   troupes sont un budget **commun** : 875 places, ce n'est pas 875 par type. Chaque curseur est
+   donc borné par ce qui reste une fois les autres types servis — quand la composition est pleine,
+   un type ne peut plus que baisser, et c'est exactement la contrainte du jeu. */
+const roomFor = (key) => Math.max(0, simu.types.slots - (simuUsed() - (simu.piles.get(key) || 0)));
+
 function renderSimu({ keepResult = true } = {}) {
     const box = $('#simu-body');
     const t = simu.types;
@@ -746,12 +1451,8 @@ function renderSimu({ keepResult = true } = {}) {
             <section class="simu-setup">
                 <h2 class="block">1 · Contre qui</h2>
                 <div class="field">
-                    <label for="simu-foe">Combat archivé</label>
-                    <select id="simu-foe">
-                        ${simu.scenarios.map((s) => `<option value="${s.fightId}" ${s.fightId === simu.fightId ? 'selected' : ''}>
-                            ${esc(s.opponent.name)} — ${esc(s.role)} · ${esc(when(s.at))} · ${num(s.army.qty)} unités${s.won ? ' · gagné' : ''}
-                        </option>`).join('')}
-                    </select>
+                    <label>Combat archivé — parcours la liste ou tape un nom</label>
+                    <div id="simu-foe"></div>
                 </div>
                 ${sc ? foeCard(sc) : ''}
 
@@ -761,14 +1462,18 @@ function renderSimu({ keepResult = true } = {}) {
         .map(([k, label]) => `<button type="button" class="seg-btn${simu.source === k ? ' is-on' : ''}" data-source="${k}">${label}</button>`).join('')}
                 </div>
                 <div class="simu-bar ${over ? 'is-over' : ''}">
-                    <span><strong>${num(used)}</strong> / ${num(t.slots)} places</span>
+                    <span><strong>${num(used)}</strong> / ${num(t.slots)} places${used < t.slots
+        ? ` <span style="color:var(--text-3)">· ${num(t.slots - used)} libre${t.slots - used > 1 ? 's' : ''}</span>` : ''}</span>
                     <span class="meter"><i style="width:${Math.min(100, (100 * used) / t.slots)}%"></i></span>
                     <span class="${simuTypes() > t.typeSlots ? 'v-bad' : ''}">${simuTypes()} / ${t.typeSlots} types</span>
                 </div>
-                ${over ? callout(`Tu dépasses de <strong>${num(used - t.slots)}</strong> places : cette composition
-                    n’est pas alignable en jeu. Le combat se jouera quand même, mais le résultat ne veut rien dire.`, 'bad') : ''}
-                <p class="note">Une capacité ne s’allume qu’à partir de <strong>${num(t.need)}</strong> unités
-                    (10 % de tes places). En dessous, le type la porte sans qu’elle agisse.</p>
+                ${over ? callout(`Cette composition demande <strong>${num(used - t.slots)}</strong> places de plus
+                    que tes ${num(t.slots)} : elle n’est pas alignable en jeu. Elle vient d’un combat où tu avais
+                    d’autres places. Touche à n’importe quelle quantité et elle reviendra dans le budget.`, 'bad') : ''}
+                <p class="note">Les places sont un budget <strong>commun</strong> : chaque curseur s’arrête à
+                    ce qui reste. Pour renforcer un type quand tout est distribué, baisse-en un autre d’abord.
+                    Une capacité ne s’allume qu’à partir de <strong>${num(t.need)}</strong> unités (10 % de tes
+                    places) — en dessous, le type la porte sans qu’elle agisse.</p>
                 <div class="simu-types">${t.types.map(typeRow).join('')}</div>
 
                 <h2 class="block">3 · Dans quelles conditions</h2>
@@ -803,13 +1508,15 @@ function renderSimu({ keepResult = true } = {}) {
 function foeCard(sc) {
     return `<div class="foe-card">
         <div class="foe-head">
+            ${avatarChip(sc.opponent.avatar, sc.opponent.name, { size: 'sm' })}
             <strong>${esc(sc.opponent.name)}</strong>
             <span class="chip chip-role">niveau ${num(sc.opponent.level)}</span>
             ${sc.fort ? `<span class="chip">${sc.fort} % de fortifications</span>` : ''}
             <span class="${sc.won ? 'v-good' : 'v-bad'}">${sc.won ? 'gagné' : 'perdu'} ce jour-là</span>
         </div>
         <p>${num(sc.army.qty)} unités · ${num(sc.army.hp)} PV ·
-            ${sc.army.piles.filter((p) => !p.reinforcement).map((p) => `${esc(p.fr)}&nbsp;×${num(p.qty)}`).join(', ')}
+            <span class="foe-mix">${sc.army.piles.filter((p) => !p.reinforcement)
+        .map((p) => unitChip(p.key, `${p.fr} ×${num(p.qty)}`, { size: 'sm' })).join('')}</span>
             ${sc.army.piles.some((p) => p.reinforcement) ? `<span style="color:var(--text-3)"> + ${sc.army.piles.filter((p) => p.reinforcement).length} renfort(s) de famille</span>` : ''}</p>
     </div>`;
 }
@@ -817,8 +1524,10 @@ function foeCard(sc) {
 function typeRow(t) {
     const qty = simu.piles.get(t.key) || 0;
     const on = qty >= simu.types.need;
-    const max = simu.types.slots;
+    const max = roomFor(t.key);
     return `<div class="type-row${qty ? ' is-in' : ''}">
+        <img class="type-face" src="${unitFace(t.key)}" alt="" width="40" height="40" loading="lazy"
+            onerror="this.remove()">
         <div class="type-id">
             <strong>${esc(t.fr)}</strong>
             <small>${esc(t.roleFr || '')} · ${esc(t.abilityFr || 'sans capacité')} · niv. ${t.typeLevel}</small>
@@ -843,10 +1552,24 @@ function wireSimu() {
     sync();
     ready.addEventListener('input', sync);
 
-    $('#simu-foe').addEventListener('change', (e) => {
-        simu.fightId = Number(e.target.value);
-        if (simu.source === 'fight') useSource('fight');
-        renderSimu({ keepResult: false });
+    picker($('#simu-foe'), {
+        items: simu.scenarios.map((s) => ({
+            value: String(s.fightId),
+            name: s.opponent.name,
+            avatar: s.opponent.avatar,
+            label: `<strong>${esc(s.opponent.name)}</strong> <span style="color:var(--text-3)">niv. ${num(s.opponent.level)}</span>`,
+            sub: `${esc(s.role)} · ${esc(when(s.at))} · ${num(s.army.qty)} unités · ${s.won ? 'gagné' : 'perdu'}`,
+            // Le combat se cherche aussi par type engagé : « contre qui j'ai vu des brutes ? »
+            search: `${s.opponent.name} ${s.role} ${s.won ? 'gagné victoire' : 'perdu défaite'} `
+                + s.army.piles.map((p) => p.fr).join(' '),
+        })),
+        value: simu.fightId,
+        placeholder: 'Chercher un adversaire…',
+        onPick: (v) => {
+            simu.fightId = Number(v);
+            if (simu.source === 'fight') useSource('fight');
+            renderSimu({ keepResult: false });
+        },
     });
 
     for (const b of $$('[data-source]', box)) {
@@ -856,17 +1579,22 @@ function wireSimu() {
     /* Curseur et champ numérique pilotent la même valeur : on met à jour sans re-rendre toute la
        page, sinon le curseur perdrait le focus à chaque pixel. */
     const setQty = (key, value, from) => {
-        const v = Math.max(0, Math.min(simu.types.slots, Math.round(Number(value) || 0)));
+        // On borne à la place encore libre, pas aux places totales : sans ça, chaque type pouvait
+        // prendre le budget entier et la composition dépassait sans le dire.
+        const v = Math.max(0, Math.min(roomFor(key), Math.round(Number(value) || 0)));
         simu.piles.set(key, v);
         const range = $(`[data-qty="${key}"]`, box);
         const number = $(`[data-qty-num="${key}"]`, box);
-        if (from !== 'range') range.value = v;
-        if (from !== 'num') number.value = v;
+        // Toujours réécrire les deux : si la valeur a été rabotée, le champ saisi doit le montrer.
+        range.value = v;
+        number.value = v;
+        void from;
         range.closest('.type-row').classList.toggle('is-in', v > 0);
         const badge = range.closest('.type-row').querySelector('.type-ab');
         const on = v >= simu.types.need;
         badge.className = `type-ab ${v ? (on ? 'is-on' : 'is-off') : ''}`;
         badge.textContent = v ? (on ? '✓ capacité' : `−${num(simu.types.need - v)}`) : '';
+        updateRooms(box);
         updateSimuBar();
     };
     for (const el of $$('[data-qty]', box)) el.addEventListener('input', () => setQty(el.dataset.qty, el.value, 'range'));
@@ -875,13 +1603,29 @@ function wireSimu() {
     $('[data-simu-run]').addEventListener('click', runSimu);
 }
 
+/* Donner des unités à un type en retire à tous les autres : leurs bornes suivent. Une ligne dont
+   il ne reste rien à donner se signale, au lieu de laisser croire que le curseur est cassé. */
+function updateRooms(box) {
+    for (const range of $$('[data-qty]', box)) {
+        const key = range.dataset.qty;
+        const room = roomFor(key);
+        const qty = simu.piles.get(key) || 0;
+        range.max = String(room);
+        const number = $(`[data-qty-num="${key}"]`, box);
+        if (number) number.max = String(room);
+        range.closest('.type-row').classList.toggle('is-full', room === qty && room > 0);
+    }
+}
+
 function updateSimuBar() {
     const bar = $('.simu-bar');
     if (!bar) return;
     const used = simuUsed();
     const t = simu.types;
     bar.classList.toggle('is-over', used > t.slots);
-    bar.children[0].innerHTML = `<strong>${num(used)}</strong> / ${num(t.slots)} places`;
+    const left = t.slots - used;
+    bar.children[0].innerHTML = `<strong>${num(used)}</strong> / ${num(t.slots)} places`
+        + (left > 0 ? ` <span style="color:var(--text-3)">· ${num(left)} libre${left > 1 ? 's' : ''}</span>` : '');
     bar.children[1].querySelector('i').style.width = `${Math.min(100, (100 * used) / t.slots)}%`;
     bar.children[2].textContent = `${simuTypes()} / ${t.typeSlots} types`;
     bar.children[2].className = simuTypes() > t.typeSlots ? 'v-bad' : '';
@@ -911,6 +1655,7 @@ async function runSimu() {
         });
         simu.result = res;
         host.innerHTML = renderSimuResult(res);
+        wireSimuExport(host, res);
     } catch (e) {
         host.innerHTML = callout(e.message, 'bad');
     } finally {
@@ -933,41 +1678,194 @@ function touched() {
     return false;
 }
 
+/* ── Export d'une simulation pour un agent IA ──────────────────────────────── */
+
+function wireSimuExport(host, res) {
+    const note = $('[data-copy-note]', host);
+    $('[data-simu-copy]', host)?.addEventListener('click', async (e) => {
+        e.target.disabled = true;
+        try {
+            const md = buildSimuMarkdown(res);
+            await navigator.clipboard.writeText(md);
+            if (note) note.innerHTML = `<span class="v-good">Copié — ${num(md.length)} caractères.</span>`;
+        } catch (err) {
+            if (note) note.innerHTML = `<span class="v-bad">Copie impossible (${esc(err.message)}).</span>`;
+        } finally {
+            e.target.disabled = false;
+        }
+    });
+    $('[data-simu-dl]', host)?.addEventListener('click', () => {
+        downloadMd(`sss-simulation-${res.setup.fightId}-${Date.now()}.md`, buildSimuMarkdown(res));
+    });
+}
+
+/* Le compte rendu d'une simulation, en Markdown. Même contrat que les autres exports : le mesuré
+   annoncé comme tel, le modélisé chiffré, les limites en clair — un agent qui ignore ce qu'il ne
+   sait pas donne de mauvais conseils avec aplomb. */
+function buildSimuMarkdown(res) {
+    const r = res.result;
+    const mc = r.monteCarlo;
+    const fmt = (x) => String(x ?? '—').replace('.', ',');
+    const o = [];
+    const H = (l, t) => o.push(`${'#'.repeat(l)} ${t}`, '');
+    const P = (...xs) => o.push(...xs.filter(Boolean), '');
+    const T = (head, rows) => {
+        o.push(`| ${head.join(' | ')} |`, `| ${head.map(() => '---').join(' | ')} |`);
+        for (const row of rows) o.push(`| ${row.join(' | ')} |`);
+        o.push('');
+    };
+    const armyT = (a) => T(
+        ['Type', 'Qté', 'PV/unité', 'Dégâts moyens/coup', 'Crit %', 'Riposte %', 'Cadence', 'Capacité'],
+        a.piles.map((p) => [
+            p.fr, num(p.qty), num(p.unitHp), num(p.dmgAvg), fmt(p.crit), fmt(p.counter),
+            `${fmt(p.speed)} s`,
+            p.abilityFr ? `${p.abilityFr}${p.abilityOn ? ' ✓' : ' (éteinte : sous 10 % des places)'}` : '—',
+        ]),
+    );
+
+    H(1, `Simulation — ${res.setup.role} contre ${res.setup.opponent.name}`);
+    P('*Généré par [sss-play-check]. Le moteur rejoue les mécaniques EXACTES du jeu, rétro-conçues'
+        + ' et vérifiées à l’unité près sur mon archive de combats (tirages uniformes min…max,'
+        + ' vivants = ceil(PV ÷ PV unitaire), riposte min(cible, attaquant) × 0,6, bouclier en pool'
+        + ' commun de 8 % des PV de départ, seuils mesurés des capacités). Le jeu tire les dégâts au'
+        + ' hasard : le verdict est une probabilité, pas une promesse. Je cherche un avis : cette'
+        + ' composition vaut-elle le coup, et quoi changer ?*');
+
+    H(2, 'Mise en place');
+    P(`- adversaire : **${res.setup.opponent.name}** (niveau ${res.setup.opponent.level}), armée relevée`
+        + ` dans le combat réel n°${res.setup.fightId} — son équipement, ses fortifications, ses talents mesurés`,
+    `- rôle : **${res.setup.role}** · ses murs ${res.setup.fort.theirs || 0} % · les miens ${res.setup.fort.mine || 0} %`
+        + `${res.setup.guard ? ` · plancher du poste de garde ${res.setup.guard} %` : ''}`,
+    `- ma composition : ${res.setup.source} · ${num(res.mine.qty)} unités sur ${num(res.setup.slots)} places`
+        + `${res.setup.role === 'défense' ? ` · forme de mes troupes : ${pct(res.setup.readiness)}` : ''}`,
+    `- multiplicateur critique : ×${fmt(res.setup.critMult)} pour moi (mesuré dans mes journaux)`);
+
+    H(2, 'Mon armée — stats réelles (cartes du shop : talents et équipement compris)');
+    armyT(res.mine);
+    H(2, `Son armée — mesurée (PV servis par le jeu, cadence et talents mesurés dans ses combats)`);
+    armyT(res.theirs);
+
+    H(2, 'Résultat — modélisé');
+    if (mc) {
+        P(`- **${fmt(mc.pWin)} % de victoires** sur ${num(mc.runs)} tirages réels (${num(mc.wins)} gagnés)`,
+            `- marge (part de PV restants, moi − lui) : médiane ${fmt(mc.margin.p50)}, de ${fmt(mc.margin.p10)} à ${fmt(mc.margin.p90)} selon les tirages`,
+            `- durée : ${fmt(mc.seconds.p50)} s en médiane (${fmt(mc.seconds.p10)}–${fmt(mc.seconds.p90)})`,
+            `- PV restants moyens : moi ${pct(mc.left.A)}, lui ${pct(mc.left.B)}`);
+    }
+    if (r.chance) {
+        P(`Lecture historique : parmi mes ${r.chance.sample} combats passés à marge simulée comparable`
+            + ` (${fmt(r.chance.span[0])} à ${fmt(r.chance.span[1])}), j'en ai réellement gagné ${r.chance.wins}`
+            + ` (${r.chance.pct} %).`);
+    }
+    if (res.record) {
+        P(`La même composition contre TOUS mes ${res.record.fights} combats archivés : ${res.record.wins} victoires`
+            + ` (${fmt(res.record.winRate)} %) — ${res.record.attack.wins}/${res.record.attack.fights} en attaque,`
+            + ` ${res.record.defense.wins}/${res.record.defense.fights} en défense.`);
+    }
+    if (res.real) {
+        P(`Ce jour-là, en vrai : **${res.real.won ? 'victoire' : 'défaite'}** en ${fmt(res.real.seconds)} s avec `
+            + `${res.real.myPiles.map((p) => `${p.fr} ×${num(p.qty)}`).join(', ')} (${res.real.delta >= 0 ? '+' : ''}${res.real.delta} points).`);
+    }
+    if (r.trace?.abilities?.length) {
+        H(2, 'Capacités déclenchées (passe médiane)');
+        for (const [t, side, key, amount] of r.trace.abilities) {
+            o.push(`- ${(t / 100).toFixed(2).replace('.', ',')} s · ${side === 0 ? 'moi' : res.setup.opponent.name} : `
+                + `${ABILITY_FR_UI[key] || key}${amount ? ` (${num(amount)})` : ''}`);
+        }
+        o.push('');
+    }
+    H(2, 'Pile par pile (passe médiane)');
+    T(['Camp', 'Type', 'Engagées', 'Survivantes', 'Dégâts infligés', 'subis', 'PV restants'],
+        [...r.piles.A.map((p) => ['moi', ...pileRow(p)]), ...r.piles.B.map((p) => [res.setup.opponent.name, ...pileRow(p)])]);
+
+    H(2, 'Fiabilité et limites');
+    P(`- Sur tout mon historique, ce moteur retrouve le bon vainqueur dans ${fmt(r.accuracy)} % des cas`
+        + ' (informations d’avant-combat seulement, leave-one-out).',
+    '- Non modélisé : renforts de famille, objets que je pourrais forger, capacités jamais croisées'
+        + ' en combat (encodées depuis les règles).',
+    '- Raisonne en probabilités : la même situation peut basculer dans les deux sens.');
+
+    H(2, 'Questions à l’agent');
+    P('1. Cette composition est-elle la bonne contre cet adversaire ? Sinon, que changer en priorité ?',
+        '2. Quelles capacités pèsent vraiment ici, et lesquelles sont payées pour rien ?',
+        '3. Si la probabilité est serrée, qu’est-ce qui la ferait basculer durablement de mon côté ?');
+
+    return `${o.join('\n').replace(/\n{3,}/g, '\n\n').trim()}\n`;
+}
+
+const pileRow = (p) => [p.fr, num(p.qty), num(p.alive ?? '—'), num(p.dealt), num(p.taken), pct(p.left)];
+
 /* ── Le combat, tel qu'il se déroule ───────────────────────────────────────── */
 
 function renderSimuResult(res) {
     const r = res.result;
-    const won = r.iWon;
     const real = res.real;
     // Le rejeu d'un vrai combat a une vérité à côté de laquelle se mesurer : on la montre.
     const replay = res.setup.source.startsWith('ta composition de ce jour-là');
 
+    /* Le verdict est une PROBABILITÉ : le même duel joué des centaines de fois avec de vrais
+       tirages (le moteur reproduit les mécaniques exactes du jeu, tirages uniformes min…max,
+       critiques, ripostes, capacités). Entre 25 % et 75 %, c'est une pièce qu'on lance. */
+    const mc = r.monteCarlo;
+    const p = mc ? mc.pWin : (r.iWon ? 100 : 0);
+    const won = p >= 50;
+    const tossUp = p >= 25 && p <= 75;
+    const tone = tossUp ? 'is-close' : (won ? 'is-win' : 'is-loss');
+    const label = tossUp ? 'Trop serré' : (won ? 'Victoire probable' : 'Défaite probable');
+    const c = r.chance;
+    const fmt = (x) => String(x).replace('.', ',');
+
     return `
-        <div class="verdict ${won ? 'is-win' : 'is-loss'}">
+        <div class="verdict ${tone}">
             <div class="verdict-main">
-                <span class="verdict-label">${won ? 'Victoire' : 'Défaite'}</span>
+                <span class="verdict-label">${label}</span>
                 <span class="verdict-sub">contre ${esc(res.setup.opponent.name)} · ${esc(res.setup.role)}</span>
+                ${mc ? `<span class="verdict-odds">tu gagnes <strong>${fmt(p)} %</strong> des
+                    ${num(mc.runs)} combats simulés avec de vrais tirages (${num(mc.wins)} victoires)</span>` : ''}
             </div>
             <dl class="verdict-stats">
-                <div><dt>Marge</dt><dd>${r.margin > 0 ? '+' : ''}${String(r.margin).replace('.', ',')}</dd></div>
-                <div><dt>Durée</dt><dd>${String(r.seconds).replace('.', ',')} s</dd></div>
+                ${mc ? `
+                <div><dt>Probabilité</dt><dd>${fmt(p)} %</dd></div>
+                <div><dt>Marge médiane</dt><dd>${mc.margin.p50 > 0 ? '+' : ''}${fmt(mc.margin.p50)}
+                    <small style="color:var(--text-3)">(${fmt(mc.margin.p10)} à ${fmt(mc.margin.p90)})</small></dd></div>
+                <div><dt>Durée</dt><dd>${fmt(mc.seconds.p50)} s
+                    <small style="color:var(--text-3)">(${fmt(mc.seconds.p10)}–${fmt(mc.seconds.p90)})</small></dd></div>
+                <div><dt>Mes PV restants</dt><dd>${pct(mc.left.A)}</dd></div>
+                <div><dt>Les siens</dt><dd>${pct(mc.left.B)}</dd></div>` : `
+                <div><dt>Marge</dt><dd>${r.margin > 0 ? '+' : ''}${fmt(r.margin)}</dd></div>
+                <div><dt>Durée</dt><dd>${fmt(r.seconds)} s</dd></div>
                 <div><dt>Mes PV restants</dt><dd>${pct(r.left.A)}</dd></div>
-                <div><dt>Les siens</dt><dd>${pct(r.left.B)}</dd></div>
+                <div><dt>Les siens</dt><dd>${pct(r.left.B)}</dd></div>`}
             </dl>
         </div>
 
+        ${mc && c ? oddsCallout(c, r, tossUp, mc) : ''}
+
+        <div class="export-row">
+            <button type="button" class="btn" data-simu-copy>Copier pour un agent IA</button>
+            <button type="button" class="btn" data-simu-dl>Télécharger .md</button>
+            <span class="note" style="margin:0">Toute la simulation en Markdown — armées, probabilité,
+                déroulé — à coller dans une conversation avec un agent IA.</span>
+            <span data-copy-note></span>
+        </div>
+
         ${replay
-        ? callout(`<strong>Rejeu fidèle.</strong> Avec ta composition de ce jour-là, le simulateur dit
-            <strong>${won ? 'victoire' : 'défaite'}</strong> ; la réalité a été
-            <strong>${real.won ? 'une victoire' : 'une défaite'}</strong> en ${String(real.seconds).replace('.', ',')} s.
-            ${won === real.won ? 'Il retrouve le bon vainqueur.' : 'Il se trompe ici — c’est le cas sur environ un combat sur dix.'}`,
-            won === real.won ? 'good' : 'bad')
+        ? callout(`<strong>Rejeu fidèle.</strong> Avec ta composition de ce jour-là, la réalité a été
+            <strong>${real.won ? 'une victoire' : 'une défaite'}</strong> en ${fmt(real.seconds)} s.
+            ${tossUp
+        ? `Le simulateur donne ${fmt(p)} % de victoires : à ce niveau-là, l’issue se joue sur les
+               tirages de dégâts, pas sur la composition.
+               ${won === real.won ? 'Il penchait du bon côté cette fois.' : 'C’est le tirage qui a décidé, pas un défaut du modèle.'}`
+        : `Le simulateur donne <strong>${fmt(p)} % de victoires</strong> —
+               ${won === real.won ? 'il retrouve le bon vainqueur.' : 'il se trompe ici, et à cette probabilité ce n’est pas attendu.'}`}`,
+            tossUp ? null : (won === real.won ? 'good' : 'bad'))
         : callout(`<strong>Ce jour-là tu as ${real.won ? 'gagné' : 'perdu'}</strong> avec
             ${real.myPiles.map((p) => `${esc(p.fr)}&nbsp;×${num(p.qty)}`).join(', ')}
-            (${String(real.seconds).replace('.', ',')} s, ${real.delta >= 0 ? '+' : ''}${real.delta} points).
+            (${fmt(real.seconds)} s, ${real.delta >= 0 ? '+' : ''}${real.delta} points).
             Ci-dessus, le même adversaire affronté par la composition que tu viens de monter.`)}
 
-        <h3 class="block">Le déroulé</h3>
+        <h3 class="block">Le déroulé <small style="color:var(--text-3);font-weight:normal">— la passe
+            la plus typique des ${mc ? num(mc.runs) : ''} tirages (issue médiane)</small></h3>
         ${hpChart(r.trace, res)}
 
         <h3 class="block">Pile par pile</h3>
@@ -996,10 +1894,36 @@ function renderSimuResult(res) {
                 armée qui n’a pas fini de récupérer.</span>`,
             res.record.winRate >= 50 ? 'good' : null)}` : ''}
 
-        <p class="note">Le simulateur est déterministe : il calcule des espérances, pas un tirage. Deux
-            compositions se comparent donc sans bruit, mais un vrai combat garde sa part de hasard. Sur ton
-            historique, il retrouve le bon vainqueur dans ~90 % des cas. À utiliser pour
-            <strong>classer</strong>, pas pour promettre.</p>`;
+        <p class="note">Le moteur rejoue les <strong>mécaniques exactes du jeu</strong>, rétro-conçues
+            depuis les frises de coups de ton archive : tirages uniformes min…max, vivants =
+            ceil(PV ÷ PV unitaire), riposte min(cible, attaquant) × 0,6, bouclier en pool commun de
+            8 % des PV de départ, seuils et amplitudes mesurés des capacités (voir « Ce que
+            l’historique dit du moteur » dans l’onglet Analyse). Le jeu tire les dégâts et les
+            critiques au hasard — ton historique en contient la preuve : les combats 11055 et 11060
+            opposent les mêmes armées, l’un est gagné, l’autre perdu. Le verdict est donc une
+            <strong>probabilité</strong>, pas une promesse.
+            ${res.result.accuracy ? `Sur l’ensemble de ton historique, le moteur retrouve le bon
+            vainqueur dans ${res.result.accuracy} % des cas, en ne partant que des informations
+            d’avant-combat.` : ''}</p>`;
+}
+
+/* Un simulateur déterministe donne toujours la même réponse pour la même situation. Le jeu, lui,
+   tire les dégâts et les critiques au hasard. Afficher « victoire » sans dire à quel point c'est
+   joué, c'est transformer une tendance en promesse — et c'est ce qui donne l'impression que le
+   simulateur se trompe quand un combat « gagné » est perdu en vrai. */
+function oddsCallout(c, r, tossUp, mc) {
+    return callout(`<strong>Deux lectures qui se recoupent.</strong>
+        Le <strong>Monte-Carlo</strong> rejoue ce duel ${num(mc.runs)} fois avec de vrais tirages
+        (dégâts uniformes min…max, critiques, ripostes, cibles au sort) : <strong>${String(mc.pWin).replace('.', ',')} %</strong>
+        de victoires, marge de ${String(mc.margin.p10).replace('.', ',')} à ${String(mc.margin.p90).replace('.', ',')}
+        selon les tirages. L’<strong>historique</strong> confirme : sur tes ${c.sample} combats passés dont la
+        marge simulée était la plus proche (${String(c.span[0]).replace('.', ',')} à
+        ${String(c.span[1]).replace('.', ',')}), tu en as réellement gagné ${c.wins}, soit ${c.pct} %.
+        ${tossUp
+        ? '<strong>Autrement dit : c’est une pièce qu’on lance.</strong> À ce niveau-là, l’issue dépend'
+          + ' des tirages, pas de ta composition.'
+        : 'Les deux lectures sont assez franches pour que l’issue dépende peu des tirages.'}`,
+    tossUp ? null : (mc.pWin >= 50 ? 'good' : 'bad'));
 }
 
 /* Courbe des PV des deux camps, avec les capacités en repères. Deux lignes, pas d'aire empilée :
@@ -1050,7 +1974,7 @@ function simuPilesTable(res) {
         ['Camp', 'Type', 'Quantité', 'Capacité', 'Dégâts infligés', 'Dégâts subis', 'PV restants'],
         rows.map((p) => [
             p.side === 'moi' ? '<span class="chip chip-on">moi</span>' : `<span class="chip chip-off">${esc(p.side)}</span>`,
-            `<strong>${esc(p.fr)}</strong>`,
+            unitChip(p.key.replace(/@.*/, ''), p.fr),
             num(p.qty),
             p.ability
                 ? (p.abilityOn ? `<span class="chip chip-on">${esc(p.abilityFr || p.ability)}</span>`
@@ -1146,11 +2070,12 @@ function renderCompos() {
                     ce que vaudrait chaque composition si tu défendais avec des troupes soignées.</p>
             </div>
             <div class="card">
-                <h3>Ce qui n’est pas modélisé</h3>
-                <p>Les renforts de famille, les objets que tu pourrais forger, les capacités adverses mal
-                    documentées (coup de grâce, corruption) et la dispersion des tirages de dégâts. Le simulateur
-                    calcule des espérances : deux compositions se comparent sans bruit, mais un combat réel
-                    garde sa part de hasard.</p>
+                <h3>Comment lire les deux pourcentages</h3>
+                <p>Le <strong>classement</strong> (N/68) vient du mode « espérances » : déterministe, deux
+                    compositions se comparent sans bruit. Le <strong>% aux tirages réels</strong> rejoue
+                    chaque combat des dizaines de fois avec les vrais tirages du moteur (dégâts min…max,
+                    critiques, ripostes) : c’est la probabilité, hasard compris. Non modélisé : les renforts
+                    de famille et les objets que tu pourrais forger.</p>
             </div>
         </div>`;
     wireControls();
@@ -1158,18 +2083,27 @@ function renderCompos() {
 }
 
 /* Depuis une composition proposée, aller la jouer en duel : c'est le chaînon qui manquait entre
-   « voilà ce qui gagnerait le plus souvent » et « montre-moi ce que ça donne contre lui ». */
+   « voilà ce qui gagnerait le plus souvent » et « montre-moi ce que ça donne contre lui ».
+   `fightId` précharge l'adversaire exact ; `autorun` lance le combat sans clic supplémentaire. */
+async function trySimulator(piles, { fightId = null, autorun = false } = {}) {
+    if (!simu.types) await loadSimu();
+    if (fightId != null && simu.scenarios?.some((s) => s.fightId === Number(fightId))) {
+        simu.fightId = Number(fightId);
+    }
+    simu.source = 'blank';
+    simu.piles = new Map(piles.map((p) => [p.key, p.qty]));
+    simu.result = null;
+    location.hash = 'simulateur';
+    renderSimu({ keepResult: false });
+    if (autorun) await runSimu();
+}
+
 function wireTryButtons(box) {
     for (const b of $$('[data-try]', box)) {
-        b.addEventListener('click', async () => {
-            const piles = JSON.parse(b.dataset.try);
-            if (!simu.types) await loadSimu();
-            simu.source = 'blank';
-            simu.piles = new Map(piles.map((p) => [p.key, p.qty]));
-            simu.result = null;
-            location.hash = 'simulateur';
-            renderSimu({ keepResult: false });
-        });
+        b.addEventListener('click', () => trySimulator(JSON.parse(b.dataset.try), {
+            fightId: b.dataset.tryFight ?? null,
+            autorun: b.dataset.tryRun === '1',
+        }));
     }
 }
 
@@ -1217,6 +2151,8 @@ function compoRow(b, rank, current = false) {
             <div class="compo-mix">
                 ${b.types.map((t) => `
                     <span class="unit ${t.abilityOn ? '' : 'is-off'}">
+                        <img class="u-face" src="${unitFace(t.key)}" alt="" width="32" height="32" loading="lazy"
+                            onerror="this.remove()">
                         <b>${esc(t.fr)}</b><span class="qty">×${num(t.qty)}</span>
                         <span class="ab">${t.abilityOn ? esc(t.abilityFr || '') : 'capacité éteinte'}</span>
                     </span>`).join('')}
@@ -1224,6 +2160,8 @@ function compoRow(b, rank, current = false) {
             <div class="compo-score">
                 <b class="${b.wins / b.fights >= 0.5 ? 'v-good' : 'v-bad'}">${b.wins}/${b.fights}</b>
                 <span>${b.winRate} % des combats archivés</span>
+                ${b.pWin != null ? `<span title="Part de victoires quand chaque combat est rejoué avec de vrais tirages (Monte-Carlo)">
+                    ${String(b.pWin).replace('.', ',')} % aux tirages réels</span>` : ''}
             </div>
             <div class="compo-meta">
                 ${current ? '' : `<button type="button" class="link" data-try='${esc(JSON.stringify(b.types.map((t) => ({ key: t.key, qty: t.qty }))))}'>Essayer dans le simulateur</button>`}
@@ -1462,6 +2400,9 @@ function inline(text) {
         .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
         .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
         .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, '$1<em>$2</em>')
+        /* Les images avant les liens : `![x](y)` contient `[x](y)`. Seules les sources locales
+           sont acceptées — les documents sont générés ici, ils ne pointent pas vers l'extérieur. */
+        .replace(/!\[([^\]]*)\]\((\/[^)\s]+)\)/g, (_, alt, src) => `<img class="doc-img" src="${src}" alt="${alt}" loading="lazy" onerror="this.remove()">`)
         .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label, href) => {
             const safe = /^(https?:|#|\/)/i.test(href) ? href : '#';
             const local = /\.md$/i.test(safe);
@@ -1576,13 +2517,30 @@ function barCell(value, max, label) {
     return `<span class="bar"><span class="bar-track"><i style="width:${w}%"></i></span><span class="bar-val">${esc(label)}</span></span>`;
 }
 
-function dataTable(heads, rows, numeric = [], wrapClass = '') {
+/* `rowLink` rend la ligne entière cliquable : une liste dont seules quelques cellules réagissent
+   oblige à viser, et on ne devine pas où. L'adresse est posée sur la ligne, `wireRowLinks` s'occupe
+   du clic et du clavier. */
+function dataTable(heads, rows, numeric = [], wrapClass = '', { rowLink = null } = {}) {
     const th = heads.map((h, n) => `<th class="${numeric[n] ? 'num' : ''}">${esc(h)}</th>`).join('');
-    const tr = rows.map((r) => `<tr>${r.map((c, n) => {
-        const cls = [numeric[n] ? 'num' : '', wrapClass === `wrap-${n}` ? 'wrap' : ''].filter(Boolean).join(' ');
-        return `<td class="${cls}">${c}</td>`;
-    }).join('')}</tr>`).join('');
+    const tr = rows.map((r, i) => {
+        const href = rowLink?.[i];
+        const attrs = href ? ` class="is-link" data-row-link="${esc(href)}" tabindex="0" role="link"` : '';
+        return `<tr${attrs}>${r.map((c, n) => {
+            const cls = [numeric[n] ? 'num' : '', wrapClass === `wrap-${n}` ? 'wrap' : ''].filter(Boolean).join(' ');
+            return `<td class="${cls}">${c}</td>`;
+        }).join('')}</tr>`;
+    }).join('');
     return `<div class="scroller"><table class="data"><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table></div>`;
+}
+
+function wireRowLinks(host) {
+    for (const tr of $$('[data-row-link]', host)) {
+        const go = () => { location.hash = tr.dataset.rowLink.replace(/^#/, ''); };
+        tr.addEventListener('click', go);
+        tr.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+        });
+    }
 }
 
 function callout(html, tone) {

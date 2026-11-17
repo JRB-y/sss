@@ -27,6 +27,10 @@ jusqu'ici (`/play/view/skills`, `/play/view/inventory`) et corrigé deux erreurs
 | Simulateur | justesse 76,3 % · AUC 0,783 | **86,4 % · 0,892** (mesuré, cf. ci-dessous) |
 | Interface | 6 boutons, 3 écrans vides tant qu'on n'a pas cliqué | 1 bouton, tous les écrans se remplissent seuls |
 | Simulateur | moteur sans trace, aucun écran pour le piloter | duel jouable, déroulé visible, composition éditable |
+| Images | aucune — interface entièrement textuelle | 112 fichiers en local : troupes, objets, avatars, bâtiments, ressources |
+| Journal de combat | la frise JSON seulement — ni critiques ni KO | le journal rédigé par le jeu, stocké et affiché coup par coup |
+| Quartier général | **jamais relevé** | `data/hq.json` — ressources, bâtiments, niveau, points de compétence |
+| Export pour agent IA | inexistant | `docs/rapport.md`, téléchargeable et copiable depuis l'interface |
 | Niveau de type | stocké mais ignoré par les analyses, mal modélisé par le simulateur | formule corrigée, XP suivie, agrégats conscients du niveau |
 | Talents du personnage | **jamais relevés** — confondus avec l'équipement | `data/skills.json`, 45 nœuds décodés, appliqués au simulateur |
 
@@ -320,9 +324,236 @@ Le serveur ne savait lire aucun corps de requête : `readBody()` a été ajouté
 La réponse porte le duel (verdict, trace, pile par pile) **et** le bilan de la même composition
 contre tout l'historique, parce qu'un duel gagné ne dit rien de la suite.
 
+**Corrigé après coup** — chaque curseur de l'éditeur de composition était borné aux places
+**totales** au lieu des places **restantes** : on pouvait mettre 875 unités sur chacun des sept
+types et partir simuler une armée de 6 125 unités sur un budget de 875. Le dépassement n'était
+signalé qu'après coup par un avertissement, et le combat se jouait quand même sur une composition
+inalignable. Les places sont un budget commun : la borne de chaque type est maintenant
+`places − somme des autres`, recalculée à chaque frappe. Côté API, une composition hors budget
+reste acceptée — on peut vouloir simuler une hypothèse — mais la réponse porte désormais
+`mine.over`, le nombre de places manquantes.
+
 **Corrigé au passage** : les fichiers statiques étaient servis sans `Cache-Control`. Sur un outil
 qu'on modifie en le regardant tourner, une feuille de style retouchée ne se voyait qu'après un
 rechargement forcé. Désormais `no-store`.
+
+## 4 quater. Les images
+
+L'interface était entièrement textuelle alors que le jeu sert toutes ses images **en clair, sans
+session** — vérifié sur les portraits, les vignettes, les avatars et le sprite d'icônes. Un `fetch`
+suffit, comme pour les règles publiques.
+
+**Ajouté** : `src/assets.mjs` → `data/assets/`, 82 fichiers pour 1,5 Mo, téléchargement incrémental.
+
+Trois choix qui méritent d'être explicités :
+
+1. **Copie locale plutôt que liens vers le jeu.** Une page qui pointe vers `ssandsun.com` ne
+   s'affiche pas hors ligne et signale au serveur chaque consultation du tableau de bord. Les
+   images sont servies par le serveur local sous `/assets/`, avec un cache long — contrairement au
+   code, elles ne changent jamais sous un même nom.
+2. **Un seul sprite pour les objets.** Les 30 icônes sont des `<symbol>` monochromes dans
+   `icons.svg` : une requête au lieu de trente, et comme elles héritent de `currentColor`,
+   l'interface les teinte **par rareté** en CSS. L'icône devient porteuse d'information, pas
+   seulement décorative.
+3. **Les 21 types téléchargés d'avance**, verrouillés compris : leurs images existent déjà côté
+   serveur, et l'interface ne se trouera pas en montant de niveau.
+
+Aucune image n'est indispensable : la vignette disparaît si le fichier manque, l'avatar retombe sur
+l'initiale du pseudo. Le tableau de bord signale l'absence d'images plutôt que de la subir.
+
+**Corrigé au passage** : `src/troops.mjs` abandonnait le relevé entier au premier HTTP 409 — le
+serveur refuse les vues trop rapprochées, ce que le code *documentait* sans le gérer. Un échec
+emportait aussi la régénération de `docs/troupes.md`. Il y a maintenant trois tentatives espacées.
+
+**Aussi ajouté** : le rendu Markdown maison accepte `![alt](/chemin)` (sources locales seulement),
+ce qui met le portrait de chaque type dans sa fiche de `docs/troupes.md`.
+
+## 4 quinquies. Le journal réel des combats — et une erreur qu'il corrige
+
+`GET /play/view/fightlog?id=<id>` rend le déroulé que le jeu écrit lui-même. On avait déjà
+`report.events`, la frise brute. Pourquoi aller chercher le journal en plus ? Parce qu'il porte
+deux informations que le JSON **ne donne pas** :
+
+- quels coups ont été **critiques** — `events` ne le dit jamais ;
+- combien d'unités chaque coup a mises **KO**, calculé par le jeu.
+
+Le HTML pèse 72 Ko par combat, trois fois le combat entier. Il est donc converti en lignes
+structurées (~12 Ko) avant stockage. Les 65 combats déjà en base ont été rattrapés par lots.
+
+### Ce que ça a corrigé : mon multiplicateur de critique était faux
+
+Au §4 bis, j'avais tranché l'ambiguïté du talet *Executioner* (« +50 % de dégâts critiques ») en
+**calant** le multiplicateur sur le rejeu de l'historique. Le calage préférait ×2,25.
+
+Le journal permet de le **mesurer** directement : pour une même pile dans un même combat, le
+rapport entre la médiane de ses coups critiques et celle de ses coups normaux donne le
+multiplicateur, puisque l'équipement, les talents et le niveau de type s'annulent.
+
+| Seuil d'échantillon | Mon camp | En face |
+| --- | ---: | ---: |
+| ≥1 critique, ≥3 normaux | ×1,978 | ×1,516 |
+| ≥3 critiques, ≥5 normaux | ×1,986 | ×1,504 |
+| ≥5 critiques, ≥8 normaux | ×1,959 | ×1,504 |
+
+**×2,0 pour moi, ×1,5 en face.** Le groupe témoin est décisif : mes adversaires n'ont pas
+Executioner, et la mesure leur rend exactement la valeur documentée par les règles. La méthode est
+donc juste, et ×2,25 était du **sur-ajustement sur 61 combats**.
+
+Le code préfère désormais la mesure, et ne retombe sur le calage que si aucun journal n'est encore
+en base. À noter, parce que c'est contre-intuitif : avec ×2,0 le rejeu est *moins* bon qu'avec
+×2,25 (84,6 % contre 86,2 %). Un ajustement qui bat une mesure directe sur un échantillon court ne
+prouve rien d'autre que sa propre souplesse.
+
+### Corrigé en le regardant tourner
+
+L'affichage des armées montrait « PV restants : 100 % » sur une défaite où toutes mes piles étaient
+tombées. La pile porte deux champs — `hp` (PV au **départ**, réduits en défense si la récupération
+n'est pas finie) et `end` (PV à la **fin**) — et seul `hp` était lu. `end` n'était même pas capturé
+par `analyse.mjs`. La colonne est maintenant dédoublée : « PV au départ » et « PV à la fin ».
+
+## 4 sexies. Le QG et le compte rendu
+
+**`src/hq.mjs`** → `data/hq.json`, depuis `GET /play/state` et `GET /play/buildings`. 33 bâtiments
+avec niveau, maximum, PV et chantiers en cours ; ressources avec capacité et production ; niveau,
+XP, points de compétence, classement, attaques restantes. Un point d'historique s'ajoute quand une
+valeur suivie change.
+
+L'écran du QG signale les deux pertes invisibles : **points de compétence non dépensés** et
+**stocks au plafond** (la production correspondante est jetée).
+
+**`src/report.mjs`** → un Markdown unique destiné à être collé dans une conversation avec un agent
+IA. Le parti pris : des chiffres déjà agrégés plutôt que du JSON brut, une séparation nette entre
+ce qui est **mesuré** et ce qui est **modélisé**, et une section « limites connues » explicite.
+Servi aussi sur `/api/report.md`, téléchargeable et copiable depuis l'interface.
+
+## 4 septies. Recherche
+
+Partout où il y avait une liste de joueurs, c'était un `<select>` — inutilisable passé quelques
+dizaines d'entrées, et impossible à filtrer. Remplacé par un sélecteur unique, réutilisé dans le
+simulateur et dans l'onglet Adversaires : un champ qui filtre, une liste qui se réduit, les flèches
+et Entrée qui marchent.
+
+La recherche est insensible aux accents et à la casse (« chengri » trouve *Chengriha*), accepte
+plusieurs mots, et cherche **au-delà du nom** : taper `diablesse` sort les adversaires qui alignent
+ce type. Dans l'onglet Adversaires, choisir une entrée ouvre directement sa fiche.
+
+## 4 octies. Un bug signalé qui en cachait un vrai
+
+**Le signalement.** « Mon dernier combat contre HardCofF FILTH, j'étais en défense et je l'ai perdu.
+Dans le simulateur, il me sort toujours que je le gagne. »
+
+### Ce que l'archive dit, et qui règle la question
+
+Les combats **11055** et **11060** opposent exactement les mêmes armées :
+
+| | 11055 | 11060 |
+| --- | --- | --- |
+| Moi | bandit ×543, brute ×88, lascar ×131, racaille ×113 — 3 528 530 PV | identique |
+| Lui | bandit ×375, brute ×185, racaille ×197, voyou ×230 | identique |
+| Fortifications, poste de garde, capacités actives | 14 %, 50, les mêmes | identiques |
+| **Issue réelle** | **gagné** (528 886 PV restants) | **perdu** (0 PV) |
+
+Même situation, issues opposées. Ce qui a changé est dans les journaux :
+
+| | 11055 | 11060 |
+| --- | ---: | ---: |
+| Mes dégâts | 5 049 331 | 4 020 089 (**−20 %**) |
+| Ses dégâts | 3 229 158 | 3 757 670 (**+16 %**) |
+| Ses critiques | 8,5 % | 10,8 % |
+
+Le jeu tire les dégâts et les critiques au hasard. Un simulateur déterministe ne peut pas
+distinguer ces deux combats, et il ne le doit pas : il donne la même réponse aux deux, ce qui est
+le comportement correct. Le défaut était **dans l'affichage**, qui présentait une tendance comme un
+verdict.
+
+### Le vrai bug trouvé en creusant : le poste de garde
+
+Les règles sont explicites : « Poste de garde — en défense, tes troupes **se battent avec au moins
+30 % de leur vie** (jusqu'à 50 %) ». C'est un plancher sur les **PV de départ**.
+
+Le simulateur en faisait un **plancher permanent sur les unités vivantes pendant tout le combat** :
+`aliveOf()` renvoyait `qty × max(ratio, guard/100)`. Avec un poste de garde à 50 %, une armée à
+l'agonie continuait de frapper à mi-puissance jusqu'au bout — un bonus massif et imaginaire, du
+bon côté pour moi, sur tous mes combats en défense.
+
+Réfuté par les données autant que par les règles : dans le combat 11060, où j'avais le plancher à
+50 %, mes lascars sont passés de 131 à **34 unités** — soit 26 %.
+
+Corrigé : le poste de garde relève les PV de départ, et rien d'autre.
+
+| | Justesse | AUC | Équilibrée (att / déf) |
+| --- | ---: | ---: | --- |
+| Avant | 86,2 % | 0,896 | 92,5 / 83,3 |
+| Après | 84,6 % | **0,903** | 92,5 / **86,7** |
+
+La justesse brute baisse, le pouvoir de classement monte et la défense s'améliore nettement — c'est
+là que le bug agissait. On garde la correction : elle est exigée par les règles *et* par
+l'observation, et l'AUC ne dépend pas d'un seuil calé.
+
+### Une piste écartée en chemin
+
+Le lascar semblait frapper deux fois plus fort que simulé (829 contre 1 660 par unité). Fausse
+alerte : avec 43 % de chances de critique, **5 de ses 6 coups du combat étaient critiques** et la
+médiane tombait donc sur une valeur critique. Les coups normaux valent 842 — l'écart au simulateur
+est de 2 %.
+
+Cette vérification a produit une confirmation inattendue : les coups de cette pile valent 842
+normal, 1 640 en critique (×1,95) et 2 290 en critique sous Rage (×2,72 ≈ 2,0 × 1,35). **Le
+multiplicateur ×2,0 est confirmé une troisième fois**, par une voie indépendante.
+
+### Ce que l'affichage dit maintenant
+
+Une marge n'est pas un verdict. Pour une marge donnée, `winChance()` regarde les 15 combats de
+l'historique dont la marge simulée est la plus proche et renvoie la part réellement gagnée. Entre
+25 % et 75 %, le simulateur affiche **« Trop serré »** au lieu de désigner un vainqueur.
+
+Courbe de calibrage mesurée sur les 65 combats :
+
+| Marge simulée | Combats réellement gagnés |
+| --- | ---: |
+| −0,94 à −0,68 | 0 / 10 (0 %) |
+| −0,65 à −0,56 | 0 / 11 (0 %) |
+| −0,53 à +0,15 | 2 / 11 (18 %) |
+| +0,20 à +0,42 | 7 / 11 (**64 %**) |
+| +0,43 à +0,62 | 5 / 11 (**45 %**) |
+| +0,71 à +1,00 | 11 / 11 (100 %) |
+
+Le combat 11060 a une marge de **+0,367** — en plein dans la zone où l'issue tient au tirage.
+
+### Ce qui reste imparfait
+
+Les combats simulés durent systématiquement moins longtemps que les vrais (18 s contre 26 s sur ce
+combat). Le simulateur répartit chaque coup sur toutes les piles adverses au prorata de leurs PV,
+là où le jeu en vise une seule : aucun dégât n'est donc gaspillé en surplus sur une pile presque
+morte. L'effet joue dans les deux camps, ce qui explique que le classement reste bon, mais les
+durées affichées sont à prendre comme un ordre de grandeur.
+
+## 4 nonies. Trois corrections d'ergonomie
+
+**Une barre de ressources en permanence.** Les stocks conditionnent presque toutes les décisions du
+jeu — recruter, construire, améliorer — et il fallait aller dans une autre vue pour les voir. Barre
+collée en haut, avec les icônes du jeu, une jauge fine de remplissage, et un stock plein signalé en
+rouge (la production y est perdue). Servie avec l'état global : une requête, pas deux.
+
+**Le tableau des combats remonte.** Il était en bas de l'analyse, après six sections. Il est
+maintenant juste sous les tuiles de bilan — c'est ce qu'on vient consulter.
+
+**Les fiches deviennent des pages.** Le journal d'un combat et la fiche d'un adversaire
+s'affichaient en panneau sous la liste, ce qui obligeait à faire défiler et mélangeait deux niveaux
+de lecture. Ce sont désormais des pages à part entière, avec leur propre adresse (`#combat/11086`,
+`#adversaire/199`) : un lien se partage, le bouton du navigateur fonctionne, et l'entrée de menu
+parente reste allumée.
+
+Deux détails qui font la différence sur ce genre de navigation :
+
+- **toute la ligne est cliquable**, pas seulement une cellule. Une liste dont seules quelques
+  cellules réagissent oblige à viser, et rien n'indique où ;
+- **le bouton « Retour » fait ce qu'il annonce.** Une première version suivait l'historique du
+  navigateur — ce qui, en arrivant par un lien direct, faisait *sortir du site*, et après un détour
+  ramenait à la page précédente quelle qu'elle soit plutôt qu'à la liste promise. Il compare
+  maintenant l'adresse précédente à sa destination : si elles coïncident, `history.back()` rend la
+  liste **et sa position de défilement** (vérifié : 1 077 px retrouvés sur un tableau de 68 lignes) ;
+  sinon il pose simplement l'adresse annoncée.
 
 ## 5. Interface
 
@@ -406,6 +637,7 @@ tel quel sur une machine partagée.
 ajoutés     src/gear.mjs          modèle d'équipement, catalogue, docs/objets.md
             src/enemies.mjs       projection combats → fiches d'adversaires
             src/skills.mjs        arbre de talents → data/skills.json
+            src/assets.mjs        images du jeu → data/assets/
             docs/audit.md         ce document
 modifiés    src/fights.mjs        repère de reprise, journal, détection de trous, compteurs
             src/sim.mjs           reconstruction des piles par équipement + cadence mesurée

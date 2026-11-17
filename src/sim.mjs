@@ -1,352 +1,29 @@
 import { cardStats, median, ABILITY_FR, ROLE_FR } from './analyse.mjs';
-import { applyGear, atTypeLevel } from './gear.mjs';
+import { atTypeLevel } from './gear.mjs';
+import { army, simulate, simulateMany } from './engine.mjs';
 
 /* Simulateur de combat et recherche de compositions.
 
-   Le moteur reproduit ce que l'historique a permis de mesurer, et rien de plus :
-   — une pile frappe toutes les `vitesse` secondes et inflige
-     `unités vivantes × dégâts moyens × (1 + critique/2) × (1 − fortification adverse)` ;
-   — les unités vivantes suivent la part de PV restante du groupe (vérifié sur les events) ;
-   — la cible est tirée au sort pondérée par les PV : ici on répartit le coup au prorata des PV
-     adverses, ce qui donne la même espérance sans dépendre du hasard ;
-   — la pile touchée riposte avec une probabilité `riposte` à 60 % de ses dégâts ;
-   — le rôle de la cible ne change pas les dégâts (mesuré : écarts < 2 % sur 1 798 coups), donc
-     aucun multiplicateur de rôle n'est appliqué ;
-   — les capacités ne fonctionnent qu'au-delà de 10 % des places de troupes, avec les amplitudes
-     relevées dans les rapports (bouclier 8 %, second souffle 12 %, onde de choc 6,8 %…).
+   Le moteur (src/engine.mjs) reproduit les mécaniques EXACTES du jeu, rétro-conçues depuis les
+   frises de coups et les journaux de l'archive : intervalles de frappe déterministes, tirages
+   uniformes min…max, vivants = ceil(PV/PV unitaire), riposte min(cible, attaquant) × 0,6,
+   bouclier en pool commun (8 % des PV de départ), seuils et amplitudes mesurés des capacités.
+   Voir l'en-tête de src/engine.mjs pour la liste complète, chiffres à l'appui.
 
-   Le simulateur est déterministe : il calcule des espérances, pas un tirage. Deux compositions
-   se comparent donc sans bruit, et `backtest()` dit sur quelle part de l'historique il retrouve
-   le bon vainqueur. */
+   Deux lectures d'un même duel :
+   — le mode « espérance » (déterministe) sert à CLASSER des compositions : pas de bruit,
+     deux compos se comparent à l'identique ;
+   — le Monte-Carlo (vrais tirages, seedés) donne la PROBABILITÉ de victoire — la seule réponse
+     honnête d'un jeu qui tire les dégâts au hasard : l'archive contient deux combats identiques
+     (11055 et 11060) aux issues opposées. */
 
-const DT = 5; // pas de simulation, en centièmes de seconde
-const CAP = 9000; // 90 s : au-delà, on tranche aux PV restants (le combat médian dure 11 s)
-
-/* Amplitudes mesurées dans `report.abilities` sur l'historique. */
-const AB = {
-    shield: { at: 'start', absorbPctOfArmy: 8 },
-    ambush: { at: 'start', powerPct: 40 },
-    frenzy: { at: 'start', speedPct: 50, durationCs: 200 },
-    rage: { below: 50, dmgPct: 35, durationCs: 1000 },
-    second_wind: { below: 30, healPctOfMax: 12 },
-    shockwave: { foeLost: 30, dmgPctOfFoeArmy: 6.8 },
-    fortress: { below: 40, takenPct: -35, durationCs: 1000 },
-    last_stand: { below: 25, dmgPct: 50, speedPct: 50, durationCs: CAP },
-    intimidate: { at: 'start', foeDmgPct: -20, durationCs: 500 },
-    freeze: { at: 'start', foeFreezeCs: 50 },
-    bleed: { passive: 'crit', critMult: 2.5 },
-    reflect: { passive: 'reflect', pct: 2 },
-    execute: { foeBelow: 35, dmgPctOfFoeArmy: 5 }, // non mesuré : amplitude prudente
-    corrupt: { at: 'start', foeFreezeCs: 200, biggestOnly: true },
-};
-
-/* ---------- Construction d'une armée ---------- */
-
-/**
- * @param piles [{key, qty, unitHp, dmgAvg, crit, counter, speed, role, ability}]
- * @param slots places de troupes du camp (sert au seuil de capacité : 10 %)
- */
-export function army(piles, { slots, fort = 0, guard = 0, readiness = 1, critMult = 1.5 } = {}) {
-    const need = Math.ceil((slots || totalQty(piles)) * 0.1);
-    const list = piles.filter((p) => p.qty > 0).map((p) => ({
-        ...p,
-        maxHp: p.qty * p.unitHp,
-        // Des troupes blessées frappent moins : les unités vivantes suivent la part de PV restante.
-        // En défense, l'historique montre des piles à 70 % en moyenne (elles récupèrent encore).
-        hp: p.hp ?? p.qty * p.unitHp * (readiness ?? 1),
-        shield: 0,
-        nextHit: Math.round(p.speed * 100),
-        frozenUntil: 0,
-        buffs: [],
-        used: new Set(),
-        abilityOn: p.ability ? p.qty >= need : false,
-    }));
-    return {
-        piles: list,
-        need,
-        fort,
-        guard,
-        maxHp: list.reduce((a, p) => a + p.maxHp, 0),
-        startHp: list.reduce((a, p) => a + p.hp, 0),
-        readiness,
-        // Un coup critique frappe ×1,5 par défaut ; le talent « Executioner » le relève, et la
-        // capacité Saignée le porte à ×2,5 pour la pile qui la déclenche.
-        critMult,
-        abilities: [...new Set(list.filter((p) => p.abilityOn).map((p) => p.ability))],
-    };
-}
-
-const totalQty = (piles) => piles.reduce((a, p) => a + p.qty, 0);
-const armyHp = (a) => a.piles.reduce((s, p) => s + Math.max(0, p.hp), 0);
-
-/* ---------- Le combat ---------- */
-
-/**
- * Joue un combat entre deux armées.
- *
- * `trace: true` enregistre le déroulé — coups portés, capacités déclenchées, courbe de PV. C'est
- * ce qui permet de *regarder* un combat simulé au lieu d'en lire seulement l'issue. L'option est
- * coûteuse (des milliers d'entrées) et la recherche de compositions appelle cette fonction des
- * centaines de milliers de fois : elle reste donc éteinte par défaut, et l'enregistrement ne
- * coûte rien quand elle l'est.
- */
-export function simulate(A, B, { dt = DT, cap = CAP, trace = false } = {}) {
-    const sides = [reset(A), reset(B)];
-    const rec = trace ? newTrace(sides, dt) : null;
-    for (const [i, s] of sides.entries()) s.trace = rec ? { rec, side: i } : null;
-    for (const [i, s] of sides.entries()) openers(s, sides[1 - i]);
-    if (rec) sample(rec, sides, 0);
-
-    let t = 0;
-    while (t < cap && armyHp(sides[0]) > 0 && armyHp(sides[1]) > 0) {
-        t += dt;
-        for (const [i, me] of sides.entries()) {
-            const foe = sides[1 - i];
-            for (const p of me.piles) {
-                if (p.hp <= 0 || t < p.nextHit || t < p.frozenUntil) continue;
-                strike(p, me, foe, t);
-                p.nextHit = t + Math.round((p.speed * 100) / speedMult(p, t));
-            }
-            triggers(me, foe, t);
-        }
-        if (rec) sample(rec, sides, t);
-    }
-    if (rec) sample(rec, sides, t, true);
-
-    const hp = [armyHp(sides[0]), armyHp(sides[1])];
-    const frac = [hp[0] / (sides[0].maxHp || 1), hp[1] / (sides[1].maxHp || 1)];
-    return {
-        winner: frac[0] > frac[1] ? 'A' : 'B',
-        margin: frac[0] - frac[1],
-        seconds: t / 100,
-        timeout: t >= cap,
-        left: { A: frac[0], B: frac[1] },
-        abilities: { A: sides[0].abilities, B: sides[1].abilities },
-        piles: {
-            A: sides[0].piles.map((p) => pileResult(p)),
-            B: sides[1].piles.map((p) => pileResult(p)),
-        },
-        trace: rec ? finishTrace(rec, t) : null,
-    };
-}
-
-const pileResult = (p) => ({
-    key: p.key,
-    fr: p.fr || p.key,
-    qty: p.qty,
-    dealt: Math.round(p.dealt),
-    taken: Math.round(p.taken || 0),
-    left: p.maxHp ? Math.max(0, p.hp) / p.maxHp : 0,
-    hp: Math.round(Math.max(0, p.hp)),
-    maxHp: Math.round(p.maxHp),
-    ability: p.ability,
-    abilityFr: p.abilityFr || null,
-    abilityOn: p.abilityOn,
-    role: p.role,
-    roleFr: p.roleFr || null,
-});
-
-/* ---------- Trace du déroulé ---------- */
-
-function newTrace(sides, dt) {
-    return {
-        dt,
-        hits: [], // [t, camp, pile, dégâts, riposte]
-        abilities: [], // [t, camp, clé, charge]
-        hp: [], // [t, part de PV camp A, part de PV camp B]
-        max: [sides[0].maxHp, sides[1].maxHp],
-        start: [sides[0].startHp, sides[1].startHp],
-    };
-}
-
-/* La courbe de PV n'a pas besoin d'un point tous les 5 centièmes : on échantillonne pour rester
-   sous ~160 points, ce qui suffit largement à dessiner et garde la réponse légère. */
-function sample(rec, sides, t, force = false) {
-    const last = rec.hp[rec.hp.length - 1];
-    const step = Math.max(rec.dt, 25);
-    if (!force && last && t - last[0] < step) return;
-    if (last && last[0] === t) return;
-    rec.hp.push([
-        t,
-        Math.max(0, armyHp(sides[0])) / (rec.max[0] || 1),
-        Math.max(0, armyHp(sides[1])) / (rec.max[1] || 1),
-    ]);
-}
-
-function finishTrace(rec, t) {
-    return {
-        cs: t,
-        seconds: t / 100,
-        hp: rec.hp.map(([tt, a, b]) => [tt, Math.round(a * 1000) / 1000, Math.round(b * 1000) / 1000]),
-        hits: rec.hits,
-        abilities: rec.abilities,
-        // Dégâts cumulés par seconde et par camp : la lecture la plus parlante d'un déroulé.
-        dps: perSecond(rec.hits, t),
-    };
-}
-
-function perSecond(hits, t) {
-    const out = [];
-    for (let s = 0; s <= Math.ceil(t / 100); s += 1) out.push([s, 0, 0]);
-    for (const [tt, side, , dmg, counter] of hits) {
-        const s = Math.min(out.length - 1, Math.floor(tt / 100));
-        out[s][1 + side] += dmg;
-        if (counter) out[s][1 + (1 - side)] += counter;
-    }
-    return out.map(([s, a, b]) => [s, Math.round(a), Math.round(b)]);
-}
-
-function reset(a) {
-    return {
-        ...a,
-        piles: a.piles.map((p) => ({
-            ...p, hp: p.hp, shield: 0, dealt: 0, taken: 0,
-            nextHit: Math.round(p.speed * 100), frozenUntil: 0, buffs: [], used: new Set(),
-        })),
-    };
-}
-
-/** Capacités de début de combat : bouclier, embuscade, frénésie, intimidation, gel, corruption. */
-function openers(me, foe) {
-    for (const p of me.piles) {
-        if (!p.abilityOn) continue;
-        const spec = AB[p.ability];
-        if (!spec || spec.at !== 'start') continue;
-        if (p.ability === 'shield') {
-            const pool = (me.maxHp * spec.absorbPctOfArmy) / 100;
-            for (const q of me.piles) q.shield += (pool * q.maxHp) / (me.maxHp || 1);
-        }
-        if (p.ability === 'frenzy') for (const q of me.piles) q.buffs.push({ until: spec.durationCs, speedPct: spec.speedPct });
-        if (p.ability === 'intimidate') for (const q of foe.piles) q.buffs.push({ until: spec.durationCs, dmgPct: spec.foeDmgPct });
-        if (p.ability === 'freeze') for (const q of foe.piles) q.frozenUntil = Math.max(q.frozenUntil, spec.foeFreezeCs);
-        if (p.ability === 'corrupt') {
-            const biggest = foe.piles.slice().sort((x, y) => y.maxHp - x.maxHp)[0];
-            if (biggest) biggest.frozenUntil = Math.max(biggest.frozenUntil, spec.foeFreezeCs);
-        }
-        if (p.ability === 'ambush') {
-            for (const q of me.piles) strike(q, me, foe, 0, spec.powerPct / 100);
-        }
-        p.used.add(p.ability);
-        if (me.trace) me.trace.rec.abilities.push([0, me.trace.side, p.ability, 0]);
-    }
-}
-
-/** Un coup porté par la pile `p`, réparti sur les piles adverses au prorata de leurs PV. */
-function strike(p, me, foe, t, scale = 1) {
-    const alive = aliveOf(p, me);
-    if (alive <= 0) return;
-    const critMult = 1 + (p.crit / 100) * ((me.critMult || 1.5) - 1);
-    const power = alive * p.dmgAvg * critMult * dmgMult(p, t) * (1 - foe.fort / 100) * scale;
-    const pool = foe.piles.reduce((s, q) => s + Math.max(0, q.hp), 0);
-    if (pool <= 0) return;
-
-    let dealt = 0;
-    let back = 0;
-    for (const q of foe.piles) {
-        if (q.hp <= 0) continue;
-        const w = q.hp / pool;
-        dealt += apply(q, power * w);
-        // La cible riposte à 60 % de ses dégâts, avec sa probabilité de riposte.
-        if (q.counter > 0) {
-            const hit = (q.counter / 100) * 0.6 * aliveOf(q, foe) * q.dmgAvg * dmgMult(q, t)
-                * (1 - me.fort / 100) * w * scale;
-            const done = apply(p, hit);
-            q.dealt += done;
-            back += done;
-        }
-        if (q.abilityOn && q.ability === 'reflect') {
-            const done = apply(p, power * w * (AB.reflect.pct / 100));
-            q.dealt += done;
-            back += done;
-        }
-    }
-    p.dealt += dealt;
-    if (me.trace) {
-        me.trace.rec.hits.push([t, me.trace.side, p.key, Math.round(dealt), Math.round(back)]);
-    }
-}
-
-/** Les unités vivantes suivent la part de PV restante ; un poste de garde met un plancher. */
-function aliveOf(p, side) {
-    const ratio = Math.max(0, p.hp) / p.maxHp;
-    return p.qty * Math.max(ratio, side.guard ? side.guard / 100 : 0) * (ratio > 0 ? 1 : 0);
-}
-
-/** Applique des dégâts à une pile (bouclier d'abord) et renvoie ce qui a réellement porté. */
-function apply(q, dmg) {
-    let rest = dmg;
-    if (q.shield > 0) {
-        const eaten = Math.min(q.shield, rest);
-        q.shield -= eaten;
-        rest -= eaten;
-    }
-    const dealt = Math.min(rest, Math.max(0, q.hp));
-    q.hp -= rest;
-    const total = dealt + (dmg - rest); // le bouclier absorbé compte dans les dégâts infligés
-    q.taken = (q.taken || 0) + total;
-    return total;
-}
-
-const dmgMult = (p, t) => p.buffs.reduce((m, b) => (t <= b.until && b.dmgPct ? m * (1 + b.dmgPct / 100) : m), 1);
-const speedMult = (p, t) => p.buffs.reduce((m, b) => (t <= b.until && b.speedPct ? m * (1 + b.speedPct / 100) : m), 1);
-
-/** Capacités à seuil : rage, second souffle, onde de choc, forteresse, dernier carré, coup de grâce. */
-function triggers(me, foe, t) {
-    const mine = armyHp(me) / (me.maxHp || 1);
-    const theirLost = 1 - armyHp(foe) / (foe.maxHp || 1);
-    for (const p of me.piles) {
-        if (!p.abilityOn || p.hp <= 0 || p.used.has(p.ability)) continue;
-        const spec = AB[p.ability];
-        if (!spec) continue;
-
-        if (spec.below != null && mine * 100 <= spec.below) {
-            p.used.add(p.ability);
-            let healed = 0;
-            if (p.ability === 'second_wind') {
-                for (const q of me.piles) {
-                    if (q.hp <= 0) continue;
-                    const before = q.hp;
-                    q.hp = Math.min(q.maxHp, q.hp + (q.maxHp * spec.healPctOfMax) / 100);
-                    healed += q.hp - before;
-                }
-            } else {
-                for (const q of me.piles) q.buffs.push({ until: t + spec.durationCs, dmgPct: spec.dmgPct, speedPct: spec.speedPct });
-                if (spec.takenPct) me.takenUntil = t + spec.durationCs;
-            }
-            if (me.trace) me.trace.rec.abilities.push([t, me.trace.side, p.ability, Math.round(healed)]);
-        }
-        if (spec.foeLost != null && theirLost * 100 >= spec.foeLost) {
-            p.used.add(p.ability);
-            if (me.trace) me.trace.rec.abilities.push([t, me.trace.side, p.ability, Math.round(burstOn(p, foe, spec))]);
-            else burstOn(p, foe, spec);
-        }
-        if (spec.foeBelow != null && armyHp(foe) / (foe.maxHp || 1) * 100 <= spec.foeBelow) {
-            p.used.add(p.ability);
-            if (me.trace) me.trace.rec.abilities.push([t, me.trace.side, p.ability, Math.round(burstOn(p, foe, spec))]);
-            else burstOn(p, foe, spec);
-        }
-    }
-}
-
-/** Souffle de capacité (onde de choc, coup de grâce) : une charge répartie au prorata des PV. */
-function burstOn(p, foe, spec) {
-    const burst = (foe.maxHp * spec.dmgPctOfFoeArmy) / 100;
-    const pool = foe.piles.reduce((s, q) => s + Math.max(0, q.hp), 0) || 1;
-    let done = 0;
-    for (const q of foe.piles) {
-        if (q.hp <= 0) continue;
-        done += apply(q, (burst * q.hp) / pool);
-    }
-    p.dealt += done;
-    return done;
-}
+export { army, simulate, simulateMany };
 
 /* ---------- Paramètres d'un type ---------- */
 
 /* Pour mes types : la carte du shop donne les stats réelles, équipement et talents compris.
-   Pour les types adverses : la carte donne vitesse, critique et riposte (ce sont des constantes
-   du type), et l'historique donne les dégâts par unité réellement observés, remis à l'échelle
-   des PV unitaires de la pile — c'est le meilleur indicateur de l'équipement d'en face. */
+   Pour les types adverses : la carte donne vitesse, critique et riposte (constantes du type),
+   l'historique donne la cadence exacte et les PV servis par le serveur. */
 export function typeParams(troops, analysis) {
     const params = new Map();
     const pool = new Map((analysis?.opponents?.pool || []).map((o) => [o.key, o]));
@@ -360,8 +37,8 @@ export function typeParams(troops, analysis) {
             // Le type seul, sans talents ni équipement : la référence sur laquelle appliquer le
             // matériel relevé d'une pile (cf. `pileStats`).
             base: {
-                unitHp: b.hp, dmgAvg: b.avgDmg, crit: b.crit, counter: b.counter, speed: b.speed,
-                typeLevel: b.typeLevel,
+                unitHp: b.hp, dmgAvg: b.avgDmg, dmgMin: b.dmgMin, dmgMax: b.dmgMax,
+                crit: b.crit, counter: b.counter, speed: b.speed, typeLevel: b.typeLevel,
             },
             key: card.key,
             fr: card.fr || card.name,
@@ -371,9 +48,12 @@ export function typeParams(troops, analysis) {
             abilityFr: card.ability?.fr || ABILITY_FR[card.ability?.key] || null,
             unitHp: s.hp,
             dmgAvg: s.avgDmg,
+            dmgMin: s.dmgMin,
+            dmgMax: s.dmgMax,
             crit: s.crit,
             counter: s.counter,
             speed: s.speed,
+            intervalCs: Math.round(s.speed * 100),
             cost: s.cost,
             dpsPerUnit: s.dpsPerUnit,
             typeLevel: s.typeLevel,
@@ -381,6 +61,7 @@ export function typeParams(troops, analysis) {
                 unitHp: measured.unitHpMedian,
                 dmgAvg: measured.dpuPerHit,
                 qtyMedian: measured.qtyMedian,
+                intervalCs: measured.intervalCs || null,
             } : null,
         });
     }
@@ -388,26 +69,19 @@ export function typeParams(troops, analysis) {
 }
 
 /* Une pile d'un combat passé, reconstruite au plus près de ce que le rapport dit vraiment.
-   Trois sources, et chacune à sa place :
+   Trois sources, chacune à sa place :
 
    1. **Servi par le serveur** — les PV unitaires. Équipement, talents et bonus de famille d'en
-      face y sont déjà : rien à deviner, et c'est vrai pour les deux camps.
-   2. **Mesuré dans la frise des coups** — la cadence réelle de la pile (`interval` = durée du
-      combat ÷ coups portés). C'est ce qui a le plus fait progresser le rejeu de l'historique
-      (justesse 76,3 → 86,4 %, pouvoir de classement 0,783 → 0,892), parce que les objets donnent
-      un bonus de vitesse intrinsèque que le jeu ne publie pas : les piles qui portent un affixe de
-      vitesse frappent ~10 % plus vite alors que l'affixe n'en promet que 1 à 6,5 %.
-   3. **Carte du shop + équipement relevé** — les stats **de base** du type (sans mes talents ni
-      mon matériel, qui ne sont pas les siens), au niveau de type de la pile, auxquelles on
-      applique les affixes des trois pièces : critique et riposte en points, dégâts en pourcentage.
-      Les dégâts sont ensuite remis à l'échelle des PV unitaires réels de la pile.
+      face y sont déjà : rien à deviner, vrai pour les deux camps.
+   2. **Mesuré dans la frise** — la cadence EXACTE de la pile (mode des écarts entre coups, en
+      centièmes). Elle intègre les bonus de vitesse intrinsèques des objets, que le jeu ne publie
+      pas : les piles à affixe de vitesse frappent ~10 % plus vite que l'affixe ne le promet.
+   3. **Carte du shop + équipement relevé** — les stats de base du type à son niveau, plus les
+      affixes des trois pièces. Le bonus intrinsèque des objets (non publié) est déduit du résidu
+      de PV et appliqué aussi aux dégâts : approximation, mais symétrique entre les camps.
 
-   Ce qu'on n'utilise **pas** : les dégâts par coup mesurés (`dpuPerHit`). Ils sont tentants, mais
-   ils incluent les capacités qui augmentent les dégâts pendant le combat (rage, frénésie, dernier
-   carré) que le simulateur réapplique ensuite — on les compterait deux fois. Vérifié sur
-   l'historique : les utiliser fait baisser le pouvoir de classement (0,892 → 0,869). Ils ne servent
-   donc que de repli pour un type dont le jeu ne m'a pas encore servi la fiche (il n'y en a aucun
-   aujourd'hui, mais ça viendra en montant de niveau). */
+   Les dégâts par coup mesurés (`dpuPerHit`) ne servent QUE de repli pour un type sans fiche :
+   ils incluent rage/frénésie que le moteur réapplique ensuite (comptage double, vérifié nocif). */
 const NO_TALENTS = { dmgPct: 0, dmgFlat: 0, critPts: 0, speedPct: 0, hpPct: 0, hpFlat: 0, counterPts: 0, counterPct: 0 };
 
 function pileStats(p, params, { fortAgainstThem = 0, talents = null } = {}) {
@@ -424,31 +98,34 @@ function pileStats(p, params, { fortAgainstThem = 0, talents = null } = {}) {
     if (!base) {
         return {
             key: p.key, fr: p.base, qty: p.qty, unitHp: p.unitHp, hp: p.hp,
-            dmgAvg: observed ?? 0,
+            dmgAvg: observed ?? 0, dmgMin: (observed ?? 0) * 0.97, dmgMax: (observed ?? 0) * 1.03,
             dmgSource: observed ? 'mesuré (type sans fiche)' : 'inconnu',
-            crit: 10, counter: 5, speed: p.interval || 1.5, speedSource: p.interval ? 'mesuré' : 'défaut',
+            crit: 10, counter: 5,
+            intervalCs: p.intervalCs || Math.round((p.interval || 1.5) * 100),
+            speed: p.interval || 1.5, speedSource: p.intervalCs ? 'mesuré' : 'défaut',
             role: p.role, roleFr: ROLE_FR[p.role] || p.role,
             ability: p.ability, abilityFr: ABILITY_FR[p.ability] || p.ability,
         };
     }
 
     const lv = atTypeLevel(base, base.typeLevel, p.typeLevel ?? base.typeLevel);
+    const lvFactor = base.dmgAvg ? lv.dmgAvg / base.dmgAvg : 1;
 
     /* Le jeu compose dans cet ordre — vérifié sur les types que je n'équipe pas, où
        `(base + plats) × (1 + %)` tombe à 1 % près sur la valeur servie :
 
            réel = (base_du_type_à_son_niveau + bonus_plats) × (1 + %talents + %objets)
 
-       Les PV unitaires sont connus (le serveur les sert). Ce qu'ils contiennent au-delà des
-       talents et des affixes, c'est le **bonus intrinsèque** des objets, que le jeu ne publie
-       pas. On le déduit du résidu de PV et on l'applique aussi aux dégâts : c'est une
-       approximation, mais elle est symétrique entre les deux camps, et c'est le seul signal
-       disponible sur le matériel d'en face. */
+       Les PV unitaires sont connus (servis). Ce qu'ils contiennent au-delà des talents et des
+       affixes, c'est le bonus intrinsèque des objets — déduit du résidu, appliqué aux dégâts. */
     const hpExplained = (lv.unitHp + (tal.hpFlat || 0)) * (1 + ((tal.hpPct || 0) + gear.hp) / 100);
     const intrinsicPct = hpExplained > 0 ? (p.unitHp / hpExplained - 1) * 100 : 0;
 
-    const dmgAvg = (lv.dmgAvg + (tal.dmgFlat || 0))
-        * (1 + ((tal.dmgPct || 0) + gear.dmg + intrinsicPct) / 100);
+    const dmgScale = (1 + ((tal.dmgPct || 0) + gear.dmg + intrinsicPct) / 100);
+    const dmgMin = (base.dmgMin * lvFactor + (tal.dmgFlat || 0)) * dmgScale;
+    const dmgMax = (base.dmgMax * lvFactor + (tal.dmgFlat || 0)) * dmgScale;
+
+    const intervalCard = Math.round((base.speed * 100) / (1 + ((tal.speedPct || 0) + gear.speed) / 100));
 
     return {
         key: p.key,
@@ -456,13 +133,16 @@ function pileStats(p, params, { fortAgainstThem = 0, talents = null } = {}) {
         qty: p.qty,
         unitHp: p.unitHp, // servi par le serveur : équipement et talents d'en face compris
         hp: p.hp,
-        dmgAvg,
+        dmgAvg: (dmgMin + dmgMax) / 2,
+        dmgMin,
+        dmgMax,
         dmgSource: 'carte + talents + équipement',
         crit: lv.crit + (tal.critPts || 0) + gear.crit,
         counter: lv.counter + (tal.counterPts || 0) + gear.riposte,
         // La cadence mesurée prime : elle intègre les bonus de vitesse que le jeu ne publie pas.
-        speed: p.interval || lv.speed / (1 + ((tal.speedPct || 0) + gear.speed) / 100),
-        speedSource: p.interval ? 'mesuré' : 'carte + talents + équipement',
+        intervalCs: p.intervalCs || intervalCard,
+        speed: (p.intervalCs || intervalCard) / 100,
+        speedSource: p.intervalCs ? 'mesuré' : 'carte + talents + équipement',
         role: p.role,
         roleFr: ROLE_FR[p.role] || p.role,
         ability: p.ability,
@@ -475,8 +155,7 @@ function pileStats(p, params, { fortAgainstThem = 0, talents = null } = {}) {
  * Une composition à monter maintenant : `[{ key, qty }]` → armée jouable.
  *
  * Les stats viennent des valeurs **réelles** de la carte du shop, qui portent déjà tes talents et
- * ton équipement du moment — c'est exactement ce que tu alignerais si tu recrutais aujourd'hui.
- * Surtout ne pas y réappliquer les talents : ils seraient comptés deux fois.
+ * ton équipement du moment. Surtout ne pas y réappliquer les talents : comptage double.
  */
 export function composeArmy(spec, params, { slots, fort = 0, guard = 0, readiness = 1, critMult = 1.5 } = {}) {
     const piles = [];
@@ -491,9 +170,12 @@ export function composeArmy(spec, params, { slots, fort = 0, guard = 0, readines
             qty: Math.round(qty),
             unitHp: t.unitHp,
             dmgAvg: t.dmgAvg,
+            dmgMin: t.dmgMin,
+            dmgMax: t.dmgMax,
             crit: t.crit,
             counter: t.counter,
             speed: t.speed,
+            intervalCs: t.intervalCs,
             role: t.role,
             roleFr: t.roleFr,
             ability: t.ability,
@@ -516,31 +198,160 @@ export function myArmyOfFight(fight, params, opts) {
     return myArmyFromFight(fight, params, opts);
 }
 
+/* ---------- Le facteur de dégâts par adversaire ----------
+
+   Les PV unitaires servis par le serveur contiennent l'équipement et les talents de VIE d'en
+   face — mais pas ses talents de DÉGÂTS, qui peuvent valoir +45 % (les miens : +21 % et
+   +70 plat). Le résidu de PV ne les voit pas, et la reconstruction par la carte se trompait
+   d'autant : mesuré ×1,4 chez certains joueurs, ×0,65 chez d'autres.
+
+   Le journal de combat donne le tirage normal médian de chaque pile (`rollMedian`). Le rapport
+   `mesuré ÷ reconstruit` est STABLE par joueur et par type (±5 % d'un combat à l'autre) : c'est
+   la signature de ses talents. On l'apprend sur ses combats passés et on l'applique aux
+   reconstructions — en backtest, le combat rejoué est exclu de sa propre mesure (leave-one-out). */
+
+const factorsCache = new WeakMap();
+
+export function opponentFactors(analysis, params, { talents = null } = {}) {
+    if (factorsCache.has(analysis)) return factorsCache.get(analysis);
+    const map = new Map(); // `${oppId}|${base}` et `${oppId}` → [{fightId, factor, critRate, critMult, counterRate}]
+    const all = [];
+    for (const f of analysis.fights) {
+        // Mes propres piles aussi : mes talents d'ALORS ne sont pas ceux d'aujourd'hui, et le
+        // journal les mesure directement. Clé `me|type`, même logique leave-one-out.
+        const fortAgainstMe = f.role === 'attaque' ? f.fort.theirs || 0 : 0;
+        for (const p of f.myPiles) {
+            if (!Number.isFinite(p.rollMedian)) continue;
+            // même reconstruction que celle sur laquelle le facteur sera appliqué : talents compris
+            const rebuilt = pileStats(p, params, { fortAgainstThem: fortAgainstMe, talents });
+            if (!(rebuilt.dmgAvg > 0) || rebuilt.dmgSource !== 'carte + talents + équipement') continue;
+            const factor = p.rollMedian / (1 - fortAgainstMe / 100) / rebuilt.dmgAvg;
+            if (!Number.isFinite(factor) || factor <= 0) continue;
+            const k = `me|${p.base}`;
+            (map.get(k) || map.set(k, []).get(k)).push({ fightId: f.id, factor });
+        }
+        const fortAgainstThem = f.role === 'défense' ? f.fort.mine || 0 : 0;
+        for (const p of f.theirPiles) {
+            const rebuilt = pileStats(p, params, { fortAgainstThem });
+            const cardOk = rebuilt.dmgAvg > 0 && rebuilt.dmgSource === 'carte + talents + équipement';
+            const factor = cardOk && Number.isFinite(p.rollMedian)
+                ? p.rollMedian / (1 - fortAgainstThem / 100) / rebuilt.dmgAvg
+                : null;
+            const s = p.logStats || {};
+            if (factor == null && s.critRate == null && s.critMult == null && s.counterRate == null) continue;
+            const entry = {
+                fightId: f.id,
+                factor: Number.isFinite(factor) && factor > 0 ? factor : null,
+                critRate: s.critRate ?? null,
+                critMult: s.critMult ?? null,
+                counterRate: s.counterRate ?? null,
+            };
+            for (const k of [`${f.opponent.id}|${p.base}`, `${f.opponent.id}`]) {
+                (map.get(k) || map.set(k, []).get(k)).push(entry);
+            }
+            all.push(entry);
+        }
+    }
+    map.set('*', all);
+    factorsCache.set(analysis, map);
+    return map;
+}
+
+/** Médiane d'une mesure apprise, du plus spécifique au plus général (type → joueur → global).
+ *  `strict` n'accepte que la clé exacte joueur|type : les taux de critique et de riposte sont
+ *  propres au TYPE (un voyou ne riposte pas comme un bandit), seul le facteur de dégâts et le
+ *  multiplicateur critique — des traits du joueur — ont le droit de généraliser. */
+function learnedStat(factors, oppId, base, excludeFightId, field, fallback = null, { strict = false } = {}) {
+    if (!factors) return fallback;
+    const keys = strict ? [`${oppId}|${base}`] : [`${oppId}|${base}`, `${oppId}`, '*'];
+    for (const k of keys) {
+        const xs = (factors.get(k) || [])
+            .filter((e) => e.fightId !== excludeFightId && Number.isFinite(e[field]))
+            .map((e) => e[field]);
+        if (xs.length) return median(xs);
+    }
+    return fallback;
+}
+
 /* Armée adverse d'un combat passé, reconstruite à partir de données d'avant-combat seulement.
-   Ses talents à lui sont inconnus : ils sont absorbés par le résidu de PV (cf. `pileStats`). */
-function foeArmyFromFight(fight, params, { role }) {
+   Ses talents à lui sont inconnus : absorbés par le résidu de PV (cf. `pileStats`). Son
+   multiplicateur critique mesuré sur l'archive vaut ×1,5 (la valeur de base).
+
+   Les capacités réellement actives sont FORCÉES depuis `abOn` du rapport : le serveur dit
+   lesquelles ont tourné, inutile de deviner son seuil de places. Recalculer l'activation
+   depuis une estimation de ses places se trompait souvent (et coûtait ~7 points de justesse). */
+function foeArmyFromFight(fight, params, { role, foeCritMult = 1.5, factors = null, excludeSelf = false }) {
     // Quand je défends, MES murs rabotaient leurs coups : il faut les retirer de la mesure.
     const fortAgainstThem = role === 'défense' ? fight.fort.mine || 0 : 0;
-    const piles = fight.theirPiles.map((p) => pileStats(p, params, { fortAgainstThem }));
+    const exclude = excludeSelf ? fight.id : null;
+    const oppId = fight.opponent.id;
+    const piles = fight.theirPiles.map((p) => {
+        const s = pileStats(p, params, { fortAgainstThem });
+        // Les talents d'en face, appris sur ses AUTRES combats (cf. `opponentFactors`) :
+        // facteur de dégâts, taux de critique et taux de riposte réellement observés.
+        const f = learnedStat(factors, oppId, p.base, exclude, 'factor', 1);
+        if (f !== 1) {
+            s.dmgMin *= f;
+            s.dmgMax *= f;
+            s.dmgAvg *= f;
+            s.dmgFactor = Math.round(f * 100) / 100;
+        }
+        const critRate = learnedStat(factors, oppId, p.base, exclude, 'critRate', null, { strict: true });
+        if (critRate != null) s.crit = critRate;
+        const counterRate = learnedStat(factors, oppId, p.base, exclude, 'counterRate', null, { strict: true });
+        if (counterRate != null) s.counter = counterRate;
+        return s;
+    });
+    // Multiplicateur critique d'en face : ×1,5 de base, ×2,0 si ses journaux montrent Executioner.
+    const mult = learnedStat(factors, oppId, null, exclude, 'critMult');
+    const critMult = mult != null && mult >= 1.75 ? 2.0 : foeCritMult;
     // Le seuil de capacité d'en face suit SES places : on l'approche par son armée engagée.
-    return army(piles, {
+    const a = army(piles, {
         slots: Math.round(fight.army.theirs.qty / 0.9),
         fort: role === 'défense' ? 0 : fight.fort.theirs,
         guard: role === 'défense' ? 0 : fight.guard,
+        critMult,
     });
+    forceAbilities(a, fight.abOnTheirs);
+    return a;
 }
 
 /** Mon armée telle qu'elle était dans un combat passé — mes talents, eux, sont connus. */
-function myArmyFromFight(fight, params, { talents = null, critMult } = {}) {
+function myArmyFromFight(fight, params, { talents = null, critMult, factors = null, excludeSelf = false } = {}) {
     // Quand j'attaquais, SES murs rabotaient mes coups.
     const fortAgainstThem = fight.role === 'attaque' ? fight.fort.theirs || 0 : 0;
-    const piles = fight.myPiles.map((p) => pileStats(p, params, { fortAgainstThem, talents }));
-    return army(piles, {
+    const exclude = excludeSelf ? fight.id : null;
+    const piles = fight.myPiles.map((p) => {
+        const s = pileStats(p, params, { fortAgainstThem, talents });
+        // Mes talents d'alors, mesurés dans mes autres combats (les cartes datent d'aujourd'hui).
+        const xs = (factors?.get(`me|${p.base}`) || [])
+            .filter((e) => e.fightId !== exclude && Number.isFinite(e.factor))
+            .map((e) => e.factor);
+        if (xs.length) {
+            const f = median(xs);
+            s.dmgMin *= f;
+            s.dmgMax *= f;
+            s.dmgAvg *= f;
+            s.dmgFactor = Math.round(f * 100) / 100;
+        }
+        return s;
+    });
+    const a = army(piles, {
         slots: Math.round((fight.abNeed || Math.ceil(fight.army.mine.qty * 0.1)) * 10),
         fort: fight.role === 'défense' ? fight.fort.mine : 0,
         guard: fight.role === 'défense' ? fight.guard : 0,
         critMult,
     });
+    forceAbilities(a, fight.abOn);
+    return a;
+}
+
+/** Aligne l'activation des capacités sur ce que le serveur a réellement fait tourner. */
+function forceAbilities(a, abOn) {
+    if (!Array.isArray(abOn)) return;
+    const on = new Set(abOn);
+    for (const p of a.piles) p.abilityOn = Boolean(p.ability) && on.has(p.ability);
+    a.abilities = [...new Set(a.piles.filter((p) => p.abilityOn).map((p) => p.ability))];
 }
 
 /* ---------- Validation : rejouer l'historique ---------- */
@@ -549,22 +360,34 @@ export function backtest(analysis, troops, { skills = null, critMult = null } = 
     const params = typeParams(troops, analysis);
     const talents = skills?.bonuses || null;
     const crit = critMult ?? myCritMultiplier(skills);
+    const factors = opponentFactors(analysis, params, { talents });
     const rows = [];
     for (const f of analysis.fights) {
-        const mine = myArmyFromFight(f, params, { talents, critMult: crit });
-        const theirs = foeArmyFromFight(f, params, { role: f.role });
+        // leave-one-out : le combat rejoué n'alimente aucune de ses propres mesures
+        const mine = myArmyFromFight(f, params, { talents, critMult: crit, factors, excludeSelf: true });
+        const theirs = foeArmyFromFight(f, params, { role: f.role, factors, excludeSelf: true });
         const res = simulate(mine, theirs);
         rows.push({ id: f.id, role: f.role, actual: f.won, predicted: res.winner === 'A', margin: res.margin });
     }
-    /* La marge classe correctement les combats, mais son zéro n'est pas le bon point de bascule :
-       le simulateur ignore tout ce qui ne se mesure pas (ordre des coups, dispersion des tirages,
-       capacités adverses mal connues). On cale donc le seuil sur l'historique — un seul paramètre,
-       ajusté sur 57 combats — et on publie la justesse obtenue avec. */
+    /* La marge (mode espérance) classe les combats ; son zéro n'est pas le point de bascule,
+       parce que tout ce qui reste inconnu (talents adverses, renforts, dispersion) décale le
+       niveau. On cale le seuil sur l'historique — un paramètre par rôle — et on publie la
+       justesse obtenue avec. La CALIBRATION (marge → probabilité) vient des voisins. */
     const threshold = {
         attaque: fitThreshold(rows.filter((r) => r.role === 'attaque')),
         défense: fitThreshold(rows.filter((r) => r.role === 'défense')),
     };
     for (const r of rows) r.predicted = r.margin > threshold[r.role];
+
+    // Probabilité par plus proches voisins de marge, et score de Brier (0 = parfait, 0,25 = pile ou face).
+    for (const r of rows) {
+        const others = rows.filter((x) => x !== r);
+        const near = winChance(others, r.margin, { k: 15 });
+        r.prob = near ? near.pct / 100 : 0.5;
+    }
+    const brier = rows.length
+        ? rows.reduce((a, r) => a + (r.prob - (r.actual ? 1 : 0)) ** 2, 0) / rows.length
+        : null;
 
     const hits = (xs) => xs.filter((r) => r.actual === r.predicted).length;
     const byRole = (name) => {
@@ -581,19 +404,62 @@ export function backtest(analysis, troops, { skills = null, critMult = null } = 
             défense: Math.round(threshold.défense * 1000) / 1000,
         },
         separation: auc(rows),
+        brier: brier != null ? Math.round(brier * 1000) / 1000 : null,
         baseline: round1((100 * Math.max(rows.filter((r) => r.actual).length, rows.filter((r) => !r.actual).length)) / rows.length),
         attack: byRole('attaque'),
         defense: byRole('défense'),
         talents: talents ? { applied: true, ...talents } : { applied: false },
         critMult: crit,
+        // Ce qui permet de traduire une marge en « combien de fois ça passe, en vrai ».
+        calibration: calibrationCurve(rows),
         rows,
     };
 }
 
-/* Multiplicateur de critique de mon camp. Le jeu part de ×1,5 et le talent « Executioner »
-   annonce `+50% critical damage` : le libellé ne dit pas si la prime passe de +50 % à +100 %
-   (×2,0) ou si les dégâts critiques eux-mêmes gagnent 50 % (×2,25). On ne tranche pas au
-   jugé — `calibrateCrit()` laisse l'historique choisir. */
+/**
+ * Probabilité de gagner à une marge donnée, lue dans l'historique.
+ *
+ * On calibre sur les voisins : pour une marge donnée, les `k` combats de l'historique dont la
+ * marge est la plus proche, et la part réellement gagnée. Estimation grossière mais honnête.
+ */
+export function winChance(rows, margin, { k = 15 } = {}) {
+    const near = rows.slice()
+        .sort((a, b) => Math.abs(a.margin - margin) - Math.abs(b.margin - margin))
+        .slice(0, Math.min(k, rows.length));
+    if (!near.length) return null;
+    const wins = near.filter((r) => r.actual).length;
+    return {
+        wins,
+        sample: near.length,
+        pct: Math.round((100 * wins) / near.length),
+        // Écart de marge couvert par l'échantillon : dit si les « voisins » le sont vraiment.
+        span: [Math.min(...near.map((r) => r.margin)), Math.max(...near.map((r) => r.margin))]
+            .map((x) => Math.round(x * 1000) / 1000),
+    };
+}
+
+/** Courbe de calibrage complète, pour l'afficher : marge → issue réelle, par tranches. */
+export function calibrationCurve(rows, bins = 6) {
+    const sorted = rows.slice().sort((a, b) => a.margin - b.margin);
+    const out = [];
+    for (let i = 0; i < bins; i += 1) {
+        const part = sorted.slice(Math.floor((i * sorted.length) / bins), Math.floor(((i + 1) * sorted.length) / bins));
+        if (!part.length) continue;
+        const wins = part.filter((r) => r.actual).length;
+        out.push({
+            from: Math.round(part[0].margin * 1000) / 1000,
+            to: Math.round(part[part.length - 1].margin * 1000) / 1000,
+            wins,
+            fights: part.length,
+            pct: Math.round((100 * wins) / part.length),
+        });
+    }
+    return out;
+}
+
+/* Multiplicateur de critique de mon camp. Le jeu part de ×1,5 ; le talent « Executioner »
+   (+50 % de dégâts critiques) le porte à ×2,0 — MESURÉ à ×1,98 dans les journaux de combat
+   (médiane des rapports crit/normal d'une même pile dans un même combat). */
 export function myCritMultiplier(skills, mode = 'bonus') {
     const pct = (skills?.bonuses?.critDmgPct || 0) / 100;
     return mode === 'total' ? 1.5 * (1 + pct) : 1.5 + pct;
@@ -610,13 +476,12 @@ export function calibrateCrit(analysis, troops, skills) {
         const bt = backtest(analysis, troops, { skills, critMult: c.critMult });
         return { ...c, accuracy: bt.accuracy, auc: bt.separation, balanced: bt.balanced.all.balanced };
     });
-    // On classe sur l'AUC : c'est la mesure indépendante du seuil, donc la moins sujette au
-    // sur-ajustement sur un historique encore court.
+    // On classe sur l'AUC : indépendante du seuil, donc la moins sujette au sur-ajustement.
     const best = tried.slice().sort((a, b) => (b.auc ?? 0) - (a.auc ?? 0) || b.balanced - a.balanced)[0];
     return { best, tried };
 }
 
-/** Justesse équilibrée et pouvoir de classement, par rôle : c'est là qu'on voit où croire le modèle. */
+/** Justesse équilibrée et pouvoir de classement, par rôle : où croire le modèle. */
 function balanced(rows) {
     const one = (xs) => {
         const w = xs.filter((r) => r.actual);
@@ -636,10 +501,9 @@ function balanced(rows) {
     return { all: one(rows), attaque: one(rows.filter((r) => r.role === 'attaque')), défense: one(rows.filter((r) => r.role === 'défense')) };
 }
 
-/* Seuil de marge calé sur l'historique. On maximise la justesse ÉQUILIBRÉE (moyenne du taux de
-   victoires bien vues et du taux de défaites bien vues) et non la justesse brute : avec 26 défaites
-   pour 4 victoires en défense, un seuil qui prédit « perdu » à tous les coups afficherait 87 % sans
-   rien discriminer. La justesse équilibrée refuse ce raccourci. */
+/* Seuil de marge calé sur l'historique. On maximise la justesse ÉQUILIBRÉE et non la brute :
+   avec beaucoup plus de défaites que de victoires en défense, « perdu à tous les coups »
+   afficherait un bon score sans rien discriminer. */
 function fitThreshold(rows) {
     if (!rows.length) return 0;
     const wins = rows.filter((r) => r.actual);
@@ -676,7 +540,7 @@ const round1 = (n) => Math.round(n * 10) / 10;
  * @param slots places de troupes disponibles
  * @param maxTypes emplacements de types (4, ou 5 avec l'Annexe)
  */
-export function recommend({ analysis, troops, slots, maxTypes = 4, keep = 8, threshold = {}, readiness = {}, critMult = 1.5 }) {
+export function recommend({ analysis, troops, slots, maxTypes = 4, keep = 8, threshold = {}, readiness = {}, critMult = 1.5, monteCarlo = 48 }) {
     const params = typeParams(troops, analysis);
     const usable = [...params.values()].filter((t) => t.dmgAvg > 0 && t.unitHp > 0);
     if (!usable.length) return { empty: true, reason: 'Aucune fiche de troupe chiffrée : lance « Relever les troupes ».' };
@@ -708,6 +572,14 @@ export function recommend({ analysis, troops, slots, maxTypes = 4, keep = 8, thr
         .map((f) => refine(f, scenarios, slots, opts))
         .sort((a, b) => b.score.wins - a.score.wins || b.score.margin - a.score.margin);
 
+    /* Les finalistes passent au Monte-Carlo : la vraie part de victoires attendue, tirages
+       compris, contre chaque combat de l'historique. C'est plus lent (on ne le fait que pour
+       le podium) mais c'est la probabilité, pas un classement. */
+    const kept = finalists.slice(0, keep).map((f) => ({
+        ...f,
+        pWin: monteCarlo > 0 ? mcScore(f.piles, scenarios, slots, opts, monteCarlo) : null,
+    }));
+
     const current = currentComposition(troops, params, slots);
     return {
         empty: false,
@@ -716,25 +588,125 @@ export function recommend({ analysis, troops, slots, maxTypes = 4, keep = 8, thr
         need: Math.ceil(slots * 0.1),
         scenarios: scenarios.length,
         screened: candidates.length,
-        best: finalists.slice(0, keep).map((f) => describe(f, slots, scenarios.length, critMult)),
-        current: current ? describe({ piles: current, score: score(current, scenarios, slots, opts) }, slots, scenarios.length, critMult) : null,
+        best: kept.map((f) => describe(f, slots, scenarios.length, critMult)),
+        current: current ? describe({
+            piles: current,
+            score: score(current, scenarios, slots, opts),
+            pWin: monteCarlo > 0 ? mcScore(current, scenarios, slots, opts, monteCarlo) : null,
+        }, slots, scenarios.length, critMult) : null,
         pool: scenarios.map((s) => ({ name: s.name, role: s.role, hp: s.army.maxHp, weight: s.weight })),
+    };
+}
+
+/**
+ * La meilleure composition contre UN combat précis — même adversaire, même rôle, mêmes murs,
+ * même forme de troupes. Trois temps : criblage en espérances (toutes les combinaisons de types
+ * par dixièmes de places), affinage par déplacements d'unités, puis Monte-Carlo des finalistes
+ * pour classer sur la vraie probabilité de victoire, tirages compris.
+ */
+export function bestAgainstFight({
+    analysis, troops, fight, slots, maxTypes = 4, readiness = 1, critMult = 1.5,
+    skills = null, keep = 3, runs = 240,
+}) {
+    const params = typeParams(troops, analysis);
+    const usable = [...params.values()].filter((t) => t.dmgAvg > 0 && t.unitHp > 0);
+    if (!usable.length) return { empty: true, reason: 'Aucune fiche de troupe chiffrée : lance « Relever les troupes ».' };
+
+    const factors = opponentFactors(analysis, params, { talents: skills?.bonuses || null });
+    const role = fight.role;
+    const scenario = {
+        id: fight.id,
+        role,
+        weight: 1,
+        army: foeArmyFromFight(fight, params, { role, factors }),
+        myFort: role === 'défense' ? fight.fort.mine : 0,
+        myGuard: role === 'défense' ? fight.guard : 0,
+    };
+    const opts = {
+        threshold: {},
+        readiness: { attack: readiness, defense: readiness },
+        critMult,
+    };
+
+    const candidates = [];
+    for (const combo of combinations(usable, maxTypes)) {
+        for (const split of tenths(combo.length)) {
+            const piles = combo.map((t, i) => ({ ...t, qty: Math.floor((slots * split[i]) / 10) }));
+            const rest = slots - piles.reduce((a, p) => a + p.qty, 0);
+            if (rest > 0) piles[piles.length - 1].qty += rest;
+            candidates.push(piles);
+        }
+    }
+
+    const scored = candidates.map((piles) => ({ piles, score: score(piles, [scenario], slots, opts) }));
+    scored.sort((a, b) => b.score.margin - a.score.margin);
+
+    // L'affinage fait souvent converger plusieurs candidats vers la même composition : on
+    // déduplique avant le Monte-Carlo, pour ne pas payer deux fois ni afficher deux fois.
+    const seen = new Set();
+    const finalists = scored.slice(0, 12)
+        .map((f) => refine(f, [scenario], slots, opts))
+        .filter((f) => {
+            const sig = f.piles.map((p) => `${p.key}:${p.qty}`).sort().join('|');
+            if (seen.has(sig)) return false;
+            seen.add(sig);
+            return true;
+        })
+        .map((f) => ({ ...f, pWin: mcScore(f.piles, [scenario], slots, opts, runs) }))
+        .sort((a, b) => (b.pWin ?? 0) - (a.pWin ?? 0) || b.score.margin - a.score.margin);
+
+    /* Les deux références : ce que j'avais engagé ce jour-là (PV réels d'alors), et ma composition
+       actuelle. C'est l'écart avec elles qui dit si le détour vaut le coup. */
+    const mkMine = (piles) => army(piles, {
+        slots, fort: scenario.myFort, guard: scenario.myGuard, readiness, critMult,
+    });
+    const historicArmy = myArmyFromFight(fight, params, {
+        talents: skills?.bonuses || null, critMult, factors,
+    });
+    const mcOf = (a) => {
+        const mc = simulateMany(a, scenario.army, { runs: Math.max(runs, 300), seed: fight.id });
+        return { pWin: Math.round(mc.pWin * 1000) / 10, margin: Math.round(mc.margin.p50 * 1000) / 1000 };
+    };
+    const current = currentComposition(troops, params, slots);
+
+    return {
+        empty: false,
+        fightId: fight.id,
+        role,
+        readiness: Math.round(readiness * 100) / 100,
+        fort: scenario.myFort,
+        foeFort: role === 'attaque' ? fight.fort.theirs : 0,
+        guard: scenario.myGuard,
+        slots,
+        maxTypes,
+        need: Math.ceil(slots * 0.1),
+        screened: candidates.length,
+        runs,
+        best: finalists.slice(0, keep).map((f) => describe(f, slots, 1, critMult)),
+        historic: {
+            ...mcOf(historicArmy),
+            types: fight.myPiles.filter((p) => !p.reinforcement)
+                .map((p) => ({ key: p.base, fr: params.get(p.base)?.fr || p.base, qty: p.qty })),
+        },
+        current: current ? { ...describe({ piles: current, score: score(current, [scenario], slots, opts) }, slots, 1, critMult), ...mcOf(mkMine(current)) } : null,
+        actual: { won: fight.won },
     };
 }
 
 /** Chaque combat de l'historique devient un scénario : même adversaire, même rôle, même fortif. */
 function buildScenarios(analysis, params) {
+    const factors = opponentFactors(analysis, params);
     const out = analysis.fights.map((f) => ({
         id: f.id,
         name: `${f.opponent.name} (${f.role})`,
         role: f.role,
         weight: 1,
-        army: foeArmyFromFight(f, params, { role: f.role }),
+        army: foeArmyFromFight(f, params, { role: f.role, factors }),
         myFort: f.role === 'défense' ? f.fort.mine : 0,
         myGuard: f.role === 'défense' ? f.guard : 0,
         representative: false,
     }));
-    // Échantillon de criblage : les plus fréquents et les extrêmes de taille d'armée, des deux rôles.
+    // Échantillon de criblage : les extrêmes et quartiles de taille d'armée, des deux rôles.
     for (const role of ['attaque', 'défense']) {
         const xs = out.filter((s) => s.role === role).sort((a, b) => a.army.maxHp - b.army.maxHp);
         for (const i of [0, xs.length >> 2, xs.length >> 1, (3 * xs.length) >> 2, xs.length - 1]) {
@@ -757,6 +729,20 @@ function score(piles, scenarios, slots, { threshold = {}, readiness = {}, critMu
         weight += s.weight;
     }
     return { wins, winRate: weight ? (100 * wins) / weight : 0, margin: weight ? margin / weight : 0 };
+}
+
+/** Part de victoires Monte-Carlo d'une compo contre tout l'historique (tirages réels). */
+function mcScore(piles, scenarios, slots, { readiness = {}, critMult = 1.5 } = {}, runs = 48) {
+    let wins = 0;
+    let total = 0;
+    for (const s of scenarios) {
+        const ready = s.role === 'défense' ? (readiness.defense ?? 1) : (readiness.attack ?? 1);
+        const mine = army(piles, { slots, fort: s.myFort, guard: s.myGuard, readiness: ready, critMult });
+        const mc = simulateMany(mine, s.army, { runs, seed: 1 + (s.id || 0) });
+        wins += mc.wins;
+        total += mc.runs;
+    }
+    return total ? Math.round((1000 * wins) / total) / 10 : null;
 }
 
 /* La grille en dixièmes place les quantités au bon ordre de grandeur ; on finit en déplaçant des
@@ -789,7 +775,7 @@ function refine(start, scenarios, slots, opts) {
     return best;
 }
 
-function describe({ piles, score: s }, slots, nScenarios, critMult = 1.5) {
+function describe({ piles, score: s, pWin = null }, slots, nScenarios, critMult = 1.5) {
     const need = Math.ceil(slots * 0.1);
     const used = piles.reduce((a, p) => a + p.qty, 0);
     // Espérance de dégâts par seconde, prime de critique comprise au vrai multiplicateur.
@@ -813,6 +799,8 @@ function describe({ piles, score: s }, slots, nScenarios, critMult = 1.5) {
         wins: Math.round(s.wins),
         fights: nScenarios,
         winRate: Math.round(s.winRate * 10) / 10,
+        // La part de victoires au Monte-Carlo : tirages réels, pas un classement déterministe.
+        pWin,
         margin: Math.round(s.margin * 1000) / 1000,
         dps: Math.round(dps),
         hp: Math.round(hp),
