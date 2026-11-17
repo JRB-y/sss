@@ -3,11 +3,17 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { config } from './config.mjs';
 import { GameSession } from './client.mjs';
-import { syncFights } from './fights.mjs';
+import { syncFights, countFights, watermarks } from './fights.mjs';
 import { syncTroops } from './troops.mjs';
+import { syncSkills } from './skills.mjs';
 import { exportRules } from './rules.mjs';
 import { loadAnalysis } from './analyse.mjs';
-import { backtest, recommend } from './sim.mjs';
+import { syncEnemies } from './enemies.mjs';
+import { syncAssets } from './assets.mjs';
+import {
+    backtest, recommend, calibrateCrit, typeParams, composeArmy,
+    enemyArmyFromFight, myArmyOfFight, simulate,
+} from './sim.mjs';
 import { log, readJson } from './util.mjs';
 
 /* Serveur local : il sert l'interface de web/ et expose les mêmes traitements que la CLI.
@@ -26,6 +32,9 @@ const MIME = {
     '.json': 'application/json; charset=utf-8',
     '.svg': 'image/svg+xml',
     '.png': 'image/png',
+    '.webp': 'image/webp',
+    '.jpg': 'image/jpeg',
+    '.ico': 'image/x-icon',
 };
 
 export async function serve({ port = 4173, host = '127.0.0.1' } = {}) {
@@ -78,6 +87,11 @@ export async function serve({ port = 4173, host = '127.0.0.1' } = {}) {
         try {
             if (url.pathname === '/api/events') return sse(res, clients);
             if (url.pathname.startsWith('/api/')) return await api(url, req, res, { run, withGame, busy });
+            /* Les images du jeu vivent dans data/ avec le reste de l'archive, pas dans le dossier
+               source : on les sert depuis là, sous le même préfixe que chez le jeu. */
+            if (url.pathname.startsWith('/assets/')) {
+                return await statics(url, res, config.paths.assets, '/assets', { immutable: true });
+            }
             return await statics(url, res, web);
         } catch (e) {
             const status = e.status || 500;
@@ -100,11 +114,16 @@ async function api(url, req, res, { run, withGame, busy }) {
     const route = url.pathname.replace(/^\/api\//, '');
 
     if (route === 'state') {
-        const [fights, troops] = await Promise.all([
+        const [fights, troops, enemies, items, skills, assets] = await Promise.all([
             readJson(config.paths.fights),
             readJson(config.paths.troops),
+            readJson(config.paths.enemies),
+            readJson(config.paths.items),
+            readJson(config.paths.skills),
+            readJson(config.paths.assetsManifest),
         ]);
         const docs = await listDocs();
+        const lastRun = fights?.runs?.[fights.runs.length - 1] || null;
         return json(res, 200, {
             ok: true,
             busy,
@@ -114,7 +133,17 @@ async function api(url, req, res, { run, withGame, busy }) {
             fights: {
                 count: Object.keys(fights?.fights || {}).length,
                 updatedAt: fights?.updatedAt || null,
-                counts: fights?.counts || null,
+                // Un fichier écrit par une version antérieure n'a ni compteurs ni repère de
+                // reprise : on les recalcule à la lecture plutôt que d'afficher des trous.
+                counts: fights?.counts?.total != null ? fights.counts : countFights(fights?.fights || {}),
+                watermark: fights?.watermark || watermarks(fights?.fights || {}),
+                window: fights?.window || null,
+                // Ce que le dernier run a vu : c'est ce qui rend la reprise lisible depuis la page.
+                lastRun: lastRun && {
+                    at: lastRun.at, mode: lastRun.mode, listed: lastRun.listed,
+                    downloaded: lastRun.downloaded, failed: lastRun.failed, holes: lastRun.holes || [],
+                },
+                holes: (fights?.runs || []).flatMap((r) => r.holes || []),
             },
             troops: {
                 count: Object.keys(troops?.units || {}).length,
@@ -122,8 +151,61 @@ async function api(url, req, res, { run, withGame, busy }) {
                 updatedAt: troops?.updatedAt || null,
                 locale: troops?.gameLocale || null,
             },
+            enemies: {
+                count: enemies?.counts?.enemies ?? 0,
+                observations: enemies?.counts?.observations ?? 0,
+                changes: enemies?.counts?.changes ?? 0,
+                updatedAt: enemies?.updatedAt || null,
+                stale: Boolean(enemies && fights && enemies.source?.fightsUpdatedAt !== fights.updatedAt),
+            },
+            items: { count: items?.counts?.items ?? 0, updatedAt: items?.updatedAt || null },
+            assets: assets && { count: Object.keys(assets.files || {}).length, counts: assets.counts, updatedAt: assets.updatedAt },
+            skills: skills && {
+                spent: skills.spent, toSpend: skills.toSpend, charLevel: skills.char?.level,
+                bonuses: skills.bonuses, updatedAt: skills.updatedAt,
+            },
             docs,
         });
+    }
+
+    /* Liste des adversaires : on ne renvoie jamais les relevés d'armée complets ici (ils pèsent
+       l'essentiel du fichier). La page demande le détail d'un seul adversaire à la fois. */
+    if (route === 'enemies') {
+        const store = await readJson(config.paths.enemies);
+        if (!store) {
+            return json(res, 200, {
+                ok: true,
+                empty: true,
+                reason: 'Aucune fiche d’adversaire : lance « Récupérer les combats » (la projection suit automatiquement).',
+            });
+        }
+        const players = Object.values(store.players)
+            .filter((p) => !p.isMe)
+            .map((p) => summarizeEnemy(p))
+            .sort((a, b) => b.record.fights - a.record.fights);
+        return json(res, 200, {
+            ok: true,
+            updatedAt: store.updatedAt,
+            account: store.account,
+            counts: store.counts,
+            me: store.players[store.account?.id] ? summarizeEnemy(store.players[store.account.id]) : null,
+            players,
+        });
+    }
+
+    if (route === 'enemy') {
+        const id = url.searchParams.get('id');
+        if (!/^\d+$/.test(id || '')) throw httpError(400, 'Identifiant d’adversaire invalide.');
+        const store = await readJson(config.paths.enemies);
+        const player = store?.players?.[id];
+        if (!player) throw httpError(404, `Aucune fiche pour l’adversaire ${id}.`);
+        return json(res, 200, { ok: true, updatedAt: store.updatedAt, player });
+    }
+
+    if (route === 'items') {
+        const store = await readJson(config.paths.items);
+        if (!store) return json(res, 200, { ok: true, empty: true, reason: 'Catalogue d’objets non construit.' });
+        return json(res, 200, { ok: true, ...store });
     }
 
     if (route === 'doc') {
@@ -138,23 +220,37 @@ async function api(url, req, res, { run, withGame, busy }) {
     if (route === 'analyse') {
         const analysis = await loadAnalysis();
         if (analysis.empty) return json(res, 200, { ok: true, empty: true, reason: analysis.reason });
-        const troops = await readJson(config.paths.troops);
-        return json(res, 200, { ok: true, analysis, backtest: troops ? backtest(analysis, troops) : null });
+        const [troops, skills] = await Promise.all([readJson(config.paths.troops), readJson(config.paths.skills)]);
+        return json(res, 200, {
+            ok: true,
+            analysis,
+            skills: skills && { char: skills.char, spent: skills.spent, spentPerBranch: skills.spentPerBranch,
+                bonuses: skills.bonuses, toSpend: skills.toSpend, updatedAt: skills.updatedAt,
+                nodes: skills.nodes.filter((n) => n.points > 0) },
+            backtest: troops ? backtest(analysis, troops, { skills, critMult: fittedCrit(analysis, troops, skills) }) : null,
+        });
+    }
+
+    if (route === 'skills') {
+        const skills = await readJson(config.paths.skills);
+        if (!skills) return json(res, 200, { ok: true, empty: true, reason: 'Arbre de talents non relevé : lance « Mettre à jour ».' });
+        return json(res, 200, { ok: true, ...skills });
     }
 
     if (route === 'compos') {
         const analysis = await loadAnalysis();
         if (analysis.empty) return json(res, 200, { ok: true, empty: true, reason: analysis.reason });
-        const troops = await readJson(config.paths.troops);
+        const [troops, skills] = await Promise.all([readJson(config.paths.troops), readJson(config.paths.skills)]);
         if (!troops) throw httpError(409, 'Aucune fiche de troupe : lance « Relever les troupes » d’abord.');
+        const critMult = fittedCrit(analysis, troops, skills);
         const crew = troops.crew || {};
         const slots = Number(url.searchParams.get('slots')) || crew.slots || analysis.fights[0]?.army.mine.qty || 100;
         const maxTypes = Number(url.searchParams.get('types')) || crew.typeSlots || 4;
         const defReadiness = clamp(Number(url.searchParams.get('readiness')) || defaultReadiness(analysis), 0.1, 1);
-        const bt = backtest(analysis, troops);
+        const bt = backtest(analysis, troops, { skills, critMult });
         const search = (defense) => recommend({
             analysis, troops, slots, maxTypes, keep: 8, threshold: bt.threshold,
-            readiness: { attack: 1, defense },
+            readiness: { attack: 1, defense }, critMult,
         });
         const result = search(defReadiness);
         // Combien vaudrait la meilleure compo si tes troupes défendaient à pleine vie ? L'écart
@@ -163,7 +259,71 @@ async function api(url, req, res, { run, withGame, busy }) {
         return json(res, 200, { ok: true, compos: result, backtest: bt, readiness: defReadiness, healed });
     }
 
+    /* Les types alignables, avec les stats qu'ils auraient aujourd'hui (talents et équipement
+       compris, puisque ce sont les valeurs « réelles » de la carte). De quoi monter une
+       composition dans la page sans rien recalculer côté navigateur. */
+    if (route === 'types') {
+        const analysis = await loadAnalysis();
+        if (analysis.empty) return json(res, 200, { ok: true, empty: true, reason: analysis.reason });
+        const troops = await readJson(config.paths.troops);
+        if (!troops) throw httpError(409, 'Aucune fiche de troupe : lance « Mettre à jour » d’abord.');
+        const params = typeParams(troops, analysis);
+        const slots = troops.crew?.slots || null;
+        return json(res, 200, {
+            ok: true,
+            slots,
+            typeSlots: troops.crew?.typeSlots || 4,
+            need: slots ? Math.ceil(slots * 0.1) : null,
+            types: [...params.values()].map((t) => ({
+                key: t.key, fr: t.fr, roleFr: t.roleFr, abilityFr: t.abilityFr, ability: t.ability,
+                unitHp: Math.round(t.unitHp), dmgAvg: Math.round(t.dmgAvg),
+                crit: t.crit, counter: t.counter, speed: t.speed,
+                typeLevel: t.typeLevel, cost: t.cost,
+                owned: troops.units?.[`troops/${t.key}`]?.owned || 0,
+                typeXp: troops.units?.[`troops/${t.key}`]?.typeXp || null,
+            })).sort((a, b) => b.dmgAvg / b.speed - a.dmgAvg / a.speed),
+            current: Object.values(troops.units || {})
+                .filter((u) => u.cat === 'troops' && u.owned > 0)
+                .map((u) => ({ key: u.key, qty: u.owned })),
+        });
+    }
+
+    /* Adversaires jouables : un par combat archivé. C'est contre ces armées-là, exactement telles
+       qu'elles étaient, qu'on peut rejouer. */
+    if (route === 'scenarios') {
+        const analysis = await loadAnalysis();
+        if (analysis.empty) return json(res, 200, { ok: true, empty: true, reason: analysis.reason });
+        return json(res, 200, {
+            ok: true,
+            scenarios: analysis.fights.map((f) => ({
+                fightId: f.id,
+                at: f.at,
+                role: f.role,
+                won: f.won,
+                opponent: f.opponent,
+                fort: f.role === 'attaque' ? f.fort.theirs : f.fort.mine,
+                army: {
+                    qty: f.army.theirs.qty,
+                    hp: f.army.theirs.hp,
+                    types: f.theirPiles.filter((p) => !p.reinforcement).length,
+                    piles: f.theirPiles.map((p) => ({
+                        key: p.base, fr: p.base, qty: p.qty, reinforcement: p.reinforcement,
+                    })),
+                },
+                mine: f.myPiles.filter((p) => !p.reinforcement).map((p) => ({ key: p.base, qty: p.qty })),
+                readiness: f.myPiles.reduce((a, p) => a + p.hp, 0) / (f.myPiles.reduce((a, p) => a + p.max, 0) || 1),
+            })),
+        });
+    }
+
     if (req.method !== 'POST') throw httpError(405, 'Méthode non autorisée.');
+
+    /* Le simulateur : un duel joué coup par coup contre un adversaire réel de l'historique.
+       Deux usages — rejouer un combat en changeant de composition, ou éprouver une composition
+       montée de toutes pièces. Rien n'est envoyé au jeu : tout se calcule ici. */
+    if (route === 'simulate') {
+        return json(res, 200, await runSimulation(await readBody(req), url));
+    }
 
     if (route === 'fetch-fights') {
         const refresh = url.searchParams.get('refresh') === '1';
@@ -173,6 +333,9 @@ async function api(url, req, res, { run, withGame, busy }) {
             return summary;
         })));
     }
+    if (route === 'fetch-skills') {
+        return json(res, 200, await run('Arbre de talents', () => withGame((s) => syncSkills(s, {}))));
+    }
     if (route === 'fetch-troops') {
         return json(res, 200, await run('Relevé des troupes', () => withGame((s) => syncTroops(s, {}))));
     }
@@ -180,8 +343,235 @@ async function api(url, req, res, { run, withGame, busy }) {
         const locale = url.searchParams.get('locale') || 'fr';
         return json(res, 200, await run('Règles officielles', () => exportRules({ locale })));
     }
+    if (route === 'fetch-assets') {
+        const force = url.searchParams.get('force') === '1';
+        return json(res, 200, await run('Images du jeu', () => syncAssets({ force })));
+    }
+    if (route === 'rebuild-enemies') {
+        return json(res, 200, await run('Fiches d’adversaires', () => syncEnemies()));
+    }
+
+    /* Le geste courant : une seule tâche, une seule connexion au jeu, tout remis à jour dans le
+       bon ordre (les combats d'abord, puisque les fiches d'adversaires en découlent). */
+    if (route === 'update-all') {
+        return json(res, 200, await run('Mise à jour complète', () => withGame(async (s) => {
+            const { store, ...fights } = await syncFights(s, { project: true });
+            const troops = await syncTroops(s, {});
+            const skills = await syncSkills(s, {});
+            // Les images sont publiques : pas besoin de la session, mais autant enchaîner ici.
+            const assets = await syncAssets({});
+            return { fights, troops, skills, assets };
+        })));
+    }
 
     throw httpError(404, `Route inconnue : ${route}`);
+}
+
+/* Fiche d'adversaire sans ses relevés d'armée : identité, bilan, dernière composition connue et
+   les dates de ses changements de troupes. De quoi remplir une liste sans transporter 1,5 Mo. */
+function summarizeEnemy(p) {
+    const latest = p.latest || null;
+    return {
+        id: p.id,
+        name: p.name,
+        aka: p.aka.length > 1 ? p.aka : [],
+        avatar: p.avatar,
+        isMe: p.isMe,
+        span: p.span,
+        level: { first: p.level.first, last: p.level.last, max: p.level.max, changes: p.level.history.length - 1 },
+        rating: { last: p.rating.last, min: p.rating.min, max: p.rating.max },
+        fort: { last: p.fort.last, max: p.fort.max },
+        record: p.record,
+        changes: p.changes.length,
+        lastChangeAt: p.changes.length ? p.changes[p.changes.length - 1].at : null,
+        changeKinds: [...new Set(p.changes.flatMap((c) => c.kinds))],
+        latest: latest && {
+            at: latest.at, fightId: latest.fightId, side: latest.side, fort: latest.fort,
+            army: latest.army,
+            abOn: latest.abOn,
+            piles: latest.piles.map((x) => ({
+                base: x.base, fr: x.fr, qty: x.qty, unitHp: x.unitHp, typeLevel: x.typeLevel,
+                roleFr: x.roleFr, abilityFr: x.abilityFr, gear: x.gear, gearBonuses: x.gearBonuses,
+                measured: x.measured,
+            })),
+            reinforcements: latest.reinforcements.length,
+        },
+    };
+}
+
+/* ---------- Le simulateur ---------- */
+
+async function runSimulation(body) {
+    const analysis = await loadAnalysis();
+    if (analysis.empty) throw httpError(409, analysis.reason);
+    const [troops, skills] = await Promise.all([readJson(config.paths.troops), readJson(config.paths.skills)]);
+    if (!troops) throw httpError(409, 'Aucune fiche de troupe : lance « Mettre à jour » d’abord.');
+
+    const params = typeParams(troops, analysis);
+    const critMult = fittedCrit(analysis, troops, skills) ?? 1.5;
+    const slots = clamp(Number(body.slots) || troops.crew?.slots || 875, 10, 100000);
+
+    // L'adversaire : un combat précis, ou le dernier croisé contre ce joueur.
+    const fight = pickFight(analysis, body);
+    if (!fight) throw httpError(404, 'Aucun combat archivé ne correspond à cet adversaire.');
+
+    const role = body.role === 'attaque' || body.role === 'défense' ? body.role : fight.role;
+    const readiness = body.readiness != null
+        ? clamp(Number(body.readiness), 0.1, 1)
+        : (role === 'défense' ? defaultReadiness(analysis) : 1);
+
+    const theirs = enemyArmyFromFight(fight, params, { role });
+    const mine = buildMine(body, fight, params, skills, {
+        slots, critMult, readiness,
+        fort: role === 'défense' ? fight.fort.mine : 0,
+        guard: role === 'défense' ? fight.guard : 0,
+    });
+    if (!mine.piles.length) throw httpError(400, 'Composition vide : mets au moins un type en jeu.');
+
+    const result = simulate(mine, theirs, { trace: true });
+
+    /* « Et contre tous les autres ? » — une composition qui gagne un duel peut perdre le reste de
+       l'historique. On le dit dans la même réponse, sans trace (ce serait énorme et inutile). */
+    let record = null;
+    if (body.all !== false && mine.spec) {
+        const bt = backtest(analysis, troops, { skills, critMult });
+        record = scoreEverywhere(analysis, params, mine.spec, {
+            slots, critMult, readiness, threshold: bt.threshold,
+        });
+    }
+
+    return {
+        ok: true,
+        setup: {
+            fightId: fight.id,
+            at: fight.at,
+            role,
+            opponent: fight.opponent,
+            fort: { mine: role === 'défense' ? fight.fort.mine : 0, theirs: role === 'attaque' ? fight.fort.theirs : 0 },
+            guard: role === 'défense' ? fight.guard : 0,
+            readiness,
+            slots,
+            need: mine.need,
+            critMult,
+            source: mine.source,
+        },
+        mine: armySummary(mine),
+        theirs: armySummary(theirs),
+        result: {
+            winner: result.winner,
+            iWon: result.winner === 'A',
+            margin: Math.round(result.margin * 1000) / 1000,
+            seconds: result.seconds,
+            timeout: result.timeout,
+            left: result.left,
+            piles: result.piles,
+            abilities: result.abilities,
+            trace: result.trace,
+        },
+        // Ce qui s'est réellement passé ce jour-là, quand on rejoue un vrai combat.
+        real: {
+            won: fight.won,
+            seconds: fight.seconds,
+            myPiles: fight.myPiles.filter((p) => !p.reinforcement)
+                .map((p) => ({ key: p.base, fr: params.get(p.base)?.fr || p.base, qty: p.qty, dealt: p.dealt })),
+            delta: fight.delta,
+        },
+        record,
+    };
+}
+
+/** Le combat visé : par id, sinon le plus récent contre ce joueur. */
+function pickFight(analysis, body) {
+    const o = body.opponent || {};
+    if (o.fightId != null) return analysis.fights.find((f) => f.id === Number(o.fightId)) || null;
+    if (o.playerId != null) {
+        return analysis.fights.filter((f) => f.opponent.id === Number(o.playerId))
+            .sort((a, b) => b.at - a.at)[0] || null;
+    }
+    return analysis.fights[0] || null;
+}
+
+/* Mon camp, selon trois origines possibles :
+   — `custom`   : la composition montée dans la page ;
+   — `current`  : ce que j'ai en ligne en ce moment (troupes possédées) ;
+   — `historic` : ce que j'avais engagé ce jour-là, reconstruit comme dans le backtest. */
+function buildMine(body, fight, params, skills, opts) {
+    const mode = body.mine?.mode || (body.mine?.piles ? 'custom' : 'current');
+
+    if (mode === 'historic') {
+        const a = myArmyOfFight(fight, params, { talents: skills?.bonuses || null, critMult: opts.critMult });
+        a.source = 'ta composition de ce jour-là, avec ses PV réels d’alors';
+        a.spec = null; // les PV d'époque ne se rejouent pas ailleurs
+        return a;
+    }
+
+    const spec = mode === 'custom'
+        ? (body.mine.piles || []).map((p) => ({ key: String(p.key), qty: Math.max(0, Number(p.qty) || 0) }))
+        : currentSpec(params, body);
+    const a = composeArmy(spec, params, opts);
+    a.source = mode === 'custom' ? 'composition montée à la main' : 'ta composition actuelle';
+    a.spec = spec.filter((p) => p.qty > 0);
+    return a;
+}
+
+function currentSpec(params, body) {
+    return (body.current || []).map((p) => ({ key: String(p.key), qty: Number(p.qty) || 0 }))
+        .filter((p) => p.qty > 0 && params.has(p.key));
+}
+
+/** La même composition jouée contre tous les combats archivés : le duel ne suffit pas à juger. */
+function scoreEverywhere(analysis, params, spec, { slots, critMult, readiness, threshold }) {
+    let wins = 0;
+    const perRole = { attaque: { wins: 0, fights: 0 }, défense: { wins: 0, fights: 0 } };
+    for (const f of analysis.fights) {
+        const ready = f.role === 'défense' ? readiness : 1;
+        const mine = composeArmy(spec, params, {
+            slots, critMult, readiness: ready,
+            fort: f.role === 'défense' ? f.fort.mine : 0,
+            guard: f.role === 'défense' ? f.guard : 0,
+        });
+        const r = simulate(mine, enemyArmyFromFight(f, params, { role: f.role }));
+        const won = r.margin > (threshold?.[f.role] ?? 0);
+        if (won) wins += 1;
+        perRole[f.role].fights += 1;
+        if (won) perRole[f.role].wins += 1;
+    }
+    const n = analysis.fights.length;
+    return {
+        wins,
+        fights: n,
+        winRate: n ? Math.round((1000 * wins) / n) / 10 : 0,
+        attack: perRole.attaque,
+        defense: perRole.défense,
+    };
+}
+
+function armySummary(a) {
+    return {
+        qty: a.piles.reduce((s, p) => s + p.qty, 0),
+        maxHp: Math.round(a.maxHp),
+        startHp: Math.round(a.startHp),
+        need: a.need,
+        fort: a.fort,
+        guard: a.guard,
+        abilities: a.abilities,
+        unknown: a.unknown || [],
+        piles: a.piles.map((p) => ({
+            key: p.key, fr: p.fr || p.key, qty: p.qty,
+            unitHp: Math.round(p.unitHp), maxHp: Math.round(p.maxHp),
+            dmgAvg: Math.round(p.dmgAvg), crit: p.crit, counter: p.counter, speed: p.speed,
+            roleFr: p.roleFr, abilityFr: p.abilityFr, abilityOn: p.abilityOn,
+            dps: Math.round((p.qty * p.dmgAvg) / (p.speed || 1)),
+        })),
+    };
+}
+
+/* Le talent « Executioner » annonce « +50 % de dégâts critiques » sans dire si la prime passe de
+   +50 % à +100 % (×2,0) ou si les dégâts critiques gagnent 50 % (×2,25). On laisse le rejeu de
+   l'historique trancher à chaque appel plutôt que de figer une interprétation. */
+function fittedCrit(analysis, troops, skills) {
+    if (!skills || !troops) return undefined;
+    return calibrateCrit(analysis, troops, skills).best.critMult;
 }
 
 /** Taux de forme des troupes en défense, mesuré sur l'historique (PV au départ / PV max). */
@@ -206,14 +596,42 @@ function sse(res, clients) {
     res.on('close', () => clients.delete(res));
 }
 
-async function statics(url, res, web) {
-    const name = url.pathname === '/' ? '/index.html' : url.pathname;
-    const file = path.join(web, path.normalize(name).replace(/^(\.\.[/\\])+/, ''));
-    if (!file.startsWith(web)) throw httpError(403, 'Chemin interdit.');
+async function statics(url, res, root, prefix = '', { immutable = false } = {}) {
+    let name = url.pathname === '/' ? '/index.html' : url.pathname;
+    if (prefix && name.startsWith(prefix)) name = name.slice(prefix.length) || '/';
+    const file = path.join(root, path.normalize(decodeURIComponent(name)).replace(/^(\.\.[/\\])+/, ''));
+    // Le séparateur compte : sans lui, un dossier voisin nommé « web-autre » passerait le test.
+    if (file !== root && !file.startsWith(root + path.sep)) throw httpError(403, 'Chemin interdit.');
     const body = await fs.readFile(file).catch(() => null);
     if (!body) throw httpError(404, `${name} introuvable.`);
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    res.writeHead(200, {
+        'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
+        /* Les images du jeu ne changent jamais sous un même nom (les avatars portent un condensat),
+           donc on les laisse en cache. Le reste est du code qu'on modifie en le regardant tourner :
+           sans `no-store`, une feuille de style retouchée ne se verrait qu'après rechargement forcé. */
+        'Cache-Control': immutable ? 'public, max-age=604800' : 'no-store',
+    });
     res.end(body);
+}
+
+/* Le serveur n'avait jamais eu besoin de lire un corps de requête : le simulateur, lui, reçoit
+   une composition entière. On plafonne la taille — c'est un serveur local, pas une passoire. */
+const MAX_BODY = 256 * 1024;
+
+async function readBody(req) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+        size += chunk.length;
+        if (size > MAX_BODY) throw httpError(413, 'Requête trop volumineuse.');
+        chunks.push(chunk);
+    }
+    if (!chunks.length) return {};
+    try {
+        return JSON.parse(Buffer.concat(chunks).toString('utf8')) || {};
+    } catch (e) {
+        throw httpError(400, `Corps de requête illisible : ${e.message}`);
+    }
 }
 
 function json(res, status, body) {

@@ -1,4 +1,5 @@
 import { cardStats, median, ABILITY_FR, ROLE_FR } from './analyse.mjs';
+import { applyGear, atTypeLevel } from './gear.mjs';
 
 /* Simulateur de combat et recherche de compositions.
 
@@ -45,7 +46,7 @@ const AB = {
  * @param piles [{key, qty, unitHp, dmgAvg, crit, counter, speed, role, ability}]
  * @param slots places de troupes du camp (sert au seuil de capacité : 10 %)
  */
-export function army(piles, { slots, fort = 0, guard = 0, readiness = 1 } = {}) {
+export function army(piles, { slots, fort = 0, guard = 0, readiness = 1, critMult = 1.5 } = {}) {
     const need = Math.ceil((slots || totalQty(piles)) * 0.1);
     const list = piles.filter((p) => p.qty > 0).map((p) => ({
         ...p,
@@ -68,6 +69,9 @@ export function army(piles, { slots, fort = 0, guard = 0, readiness = 1 } = {}) 
         maxHp: list.reduce((a, p) => a + p.maxHp, 0),
         startHp: list.reduce((a, p) => a + p.hp, 0),
         readiness,
+        // Un coup critique frappe ×1,5 par défaut ; le talent « Executioner » le relève, et la
+        // capacité Saignée le porte à ×2,5 pour la pile qui la déclenche.
+        critMult,
         abilities: [...new Set(list.filter((p) => p.abilityOn).map((p) => p.ability))],
     };
 }
@@ -77,9 +81,21 @@ const armyHp = (a) => a.piles.reduce((s, p) => s + Math.max(0, p.hp), 0);
 
 /* ---------- Le combat ---------- */
 
-export function simulate(A, B, { dt = DT, cap = CAP } = {}) {
+/**
+ * Joue un combat entre deux armées.
+ *
+ * `trace: true` enregistre le déroulé — coups portés, capacités déclenchées, courbe de PV. C'est
+ * ce qui permet de *regarder* un combat simulé au lieu d'en lire seulement l'issue. L'option est
+ * coûteuse (des milliers d'entrées) et la recherche de compositions appelle cette fonction des
+ * centaines de milliers de fois : elle reste donc éteinte par défaut, et l'enregistrement ne
+ * coûte rien quand elle l'est.
+ */
+export function simulate(A, B, { dt = DT, cap = CAP, trace = false } = {}) {
     const sides = [reset(A), reset(B)];
+    const rec = trace ? newTrace(sides, dt) : null;
+    for (const [i, s] of sides.entries()) s.trace = rec ? { rec, side: i } : null;
     for (const [i, s] of sides.entries()) openers(s, sides[1 - i]);
+    if (rec) sample(rec, sides, 0);
 
     let t = 0;
     while (t < cap && armyHp(sides[0]) > 0 && armyHp(sides[1]) > 0) {
@@ -93,7 +109,9 @@ export function simulate(A, B, { dt = DT, cap = CAP } = {}) {
             }
             triggers(me, foe, t);
         }
+        if (rec) sample(rec, sides, t);
     }
+    if (rec) sample(rec, sides, t, true);
 
     const hp = [armyHp(sides[0]), armyHp(sides[1])];
     const frac = [hp[0] / (sides[0].maxHp || 1), hp[1] / (sides[1].maxHp || 1)];
@@ -105,17 +123,84 @@ export function simulate(A, B, { dt = DT, cap = CAP } = {}) {
         left: { A: frac[0], B: frac[1] },
         abilities: { A: sides[0].abilities, B: sides[1].abilities },
         piles: {
-            A: sides[0].piles.map((p) => ({ key: p.key, dealt: Math.round(p.dealt), left: p.hp / p.maxHp })),
-            B: sides[1].piles.map((p) => ({ key: p.key, dealt: Math.round(p.dealt), left: p.hp / p.maxHp })),
+            A: sides[0].piles.map((p) => pileResult(p)),
+            B: sides[1].piles.map((p) => pileResult(p)),
         },
+        trace: rec ? finishTrace(rec, t) : null,
     };
+}
+
+const pileResult = (p) => ({
+    key: p.key,
+    fr: p.fr || p.key,
+    qty: p.qty,
+    dealt: Math.round(p.dealt),
+    taken: Math.round(p.taken || 0),
+    left: p.maxHp ? Math.max(0, p.hp) / p.maxHp : 0,
+    hp: Math.round(Math.max(0, p.hp)),
+    maxHp: Math.round(p.maxHp),
+    ability: p.ability,
+    abilityFr: p.abilityFr || null,
+    abilityOn: p.abilityOn,
+    role: p.role,
+    roleFr: p.roleFr || null,
+});
+
+/* ---------- Trace du déroulé ---------- */
+
+function newTrace(sides, dt) {
+    return {
+        dt,
+        hits: [], // [t, camp, pile, dégâts, riposte]
+        abilities: [], // [t, camp, clé, charge]
+        hp: [], // [t, part de PV camp A, part de PV camp B]
+        max: [sides[0].maxHp, sides[1].maxHp],
+        start: [sides[0].startHp, sides[1].startHp],
+    };
+}
+
+/* La courbe de PV n'a pas besoin d'un point tous les 5 centièmes : on échantillonne pour rester
+   sous ~160 points, ce qui suffit largement à dessiner et garde la réponse légère. */
+function sample(rec, sides, t, force = false) {
+    const last = rec.hp[rec.hp.length - 1];
+    const step = Math.max(rec.dt, 25);
+    if (!force && last && t - last[0] < step) return;
+    if (last && last[0] === t) return;
+    rec.hp.push([
+        t,
+        Math.max(0, armyHp(sides[0])) / (rec.max[0] || 1),
+        Math.max(0, armyHp(sides[1])) / (rec.max[1] || 1),
+    ]);
+}
+
+function finishTrace(rec, t) {
+    return {
+        cs: t,
+        seconds: t / 100,
+        hp: rec.hp.map(([tt, a, b]) => [tt, Math.round(a * 1000) / 1000, Math.round(b * 1000) / 1000]),
+        hits: rec.hits,
+        abilities: rec.abilities,
+        // Dégâts cumulés par seconde et par camp : la lecture la plus parlante d'un déroulé.
+        dps: perSecond(rec.hits, t),
+    };
+}
+
+function perSecond(hits, t) {
+    const out = [];
+    for (let s = 0; s <= Math.ceil(t / 100); s += 1) out.push([s, 0, 0]);
+    for (const [tt, side, , dmg, counter] of hits) {
+        const s = Math.min(out.length - 1, Math.floor(tt / 100));
+        out[s][1 + side] += dmg;
+        if (counter) out[s][1 + (1 - side)] += counter;
+    }
+    return out.map(([s, a, b]) => [s, Math.round(a), Math.round(b)]);
 }
 
 function reset(a) {
     return {
         ...a,
         piles: a.piles.map((p) => ({
-            ...p, hp: p.hp, shield: 0, dealt: 0,
+            ...p, hp: p.hp, shield: 0, dealt: 0, taken: 0,
             nextHit: Math.round(p.speed * 100), frozenUntil: 0, buffs: [], used: new Set(),
         })),
     };
@@ -142,6 +227,7 @@ function openers(me, foe) {
             for (const q of me.piles) strike(q, me, foe, 0, spec.powerPct / 100);
         }
         p.used.add(p.ability);
+        if (me.trace) me.trace.rec.abilities.push([0, me.trace.side, p.ability, 0]);
     }
 }
 
@@ -154,17 +240,29 @@ function strike(p, me, foe, t, scale = 1) {
     const pool = foe.piles.reduce((s, q) => s + Math.max(0, q.hp), 0);
     if (pool <= 0) return;
 
+    let dealt = 0;
+    let back = 0;
     for (const q of foe.piles) {
         if (q.hp <= 0) continue;
         const w = q.hp / pool;
-        p.dealt += apply(q, power * w);
+        dealt += apply(q, power * w);
         // La cible riposte à 60 % de ses dégâts, avec sa probabilité de riposte.
         if (q.counter > 0) {
-            const back = (q.counter / 100) * 0.6 * aliveOf(q, foe) * q.dmgAvg * dmgMult(q, t)
+            const hit = (q.counter / 100) * 0.6 * aliveOf(q, foe) * q.dmgAvg * dmgMult(q, t)
                 * (1 - me.fort / 100) * w * scale;
-            q.dealt += apply(p, back);
+            const done = apply(p, hit);
+            q.dealt += done;
+            back += done;
         }
-        if (q.abilityOn && q.ability === 'reflect') q.dealt += apply(p, power * w * (AB.reflect.pct / 100));
+        if (q.abilityOn && q.ability === 'reflect') {
+            const done = apply(p, power * w * (AB.reflect.pct / 100));
+            q.dealt += done;
+            back += done;
+        }
+    }
+    p.dealt += dealt;
+    if (me.trace) {
+        me.trace.rec.hits.push([t, me.trace.side, p.key, Math.round(dealt), Math.round(back)]);
     }
 }
 
@@ -184,7 +282,9 @@ function apply(q, dmg) {
     }
     const dealt = Math.min(rest, Math.max(0, q.hp));
     q.hp -= rest;
-    return dealt + (dmg - rest); // le bouclier absorbé compte dans les dégâts infligés
+    const total = dealt + (dmg - rest); // le bouclier absorbé compte dans les dégâts infligés
+    q.taken = (q.taken || 0) + total;
+    return total;
 }
 
 const dmgMult = (p, t) => p.buffs.reduce((m, b) => (t <= b.until && b.dmgPct ? m * (1 + b.dmgPct / 100) : m), 1);
@@ -201,26 +301,44 @@ function triggers(me, foe, t) {
 
         if (spec.below != null && mine * 100 <= spec.below) {
             p.used.add(p.ability);
+            let healed = 0;
             if (p.ability === 'second_wind') {
-                for (const q of me.piles) if (q.hp > 0) q.hp = Math.min(q.maxHp, q.hp + (q.maxHp * spec.healPctOfMax) / 100);
+                for (const q of me.piles) {
+                    if (q.hp <= 0) continue;
+                    const before = q.hp;
+                    q.hp = Math.min(q.maxHp, q.hp + (q.maxHp * spec.healPctOfMax) / 100);
+                    healed += q.hp - before;
+                }
             } else {
                 for (const q of me.piles) q.buffs.push({ until: t + spec.durationCs, dmgPct: spec.dmgPct, speedPct: spec.speedPct });
                 if (spec.takenPct) me.takenUntil = t + spec.durationCs;
             }
+            if (me.trace) me.trace.rec.abilities.push([t, me.trace.side, p.ability, Math.round(healed)]);
         }
         if (spec.foeLost != null && theirLost * 100 >= spec.foeLost) {
             p.used.add(p.ability);
-            const burst = (foe.maxHp * spec.dmgPctOfFoeArmy) / 100;
-            const pool = foe.piles.reduce((s, q) => s + Math.max(0, q.hp), 0) || 1;
-            for (const q of foe.piles) if (q.hp > 0) p.dealt += apply(q, (burst * q.hp) / pool);
+            if (me.trace) me.trace.rec.abilities.push([t, me.trace.side, p.ability, Math.round(burstOn(p, foe, spec))]);
+            else burstOn(p, foe, spec);
         }
         if (spec.foeBelow != null && armyHp(foe) / (foe.maxHp || 1) * 100 <= spec.foeBelow) {
             p.used.add(p.ability);
-            const burst = (foe.maxHp * spec.dmgPctOfFoeArmy) / 100;
-            const pool = foe.piles.reduce((s, q) => s + Math.max(0, q.hp), 0) || 1;
-            for (const q of foe.piles) if (q.hp > 0) p.dealt += apply(q, (burst * q.hp) / pool);
+            if (me.trace) me.trace.rec.abilities.push([t, me.trace.side, p.ability, Math.round(burstOn(p, foe, spec))]);
+            else burstOn(p, foe, spec);
         }
     }
+}
+
+/** Souffle de capacité (onde de choc, coup de grâce) : une charge répartie au prorata des PV. */
+function burstOn(p, foe, spec) {
+    const burst = (foe.maxHp * spec.dmgPctOfFoeArmy) / 100;
+    const pool = foe.piles.reduce((s, q) => s + Math.max(0, q.hp), 0) || 1;
+    let done = 0;
+    for (const q of foe.piles) {
+        if (q.hp <= 0) continue;
+        done += apply(q, (burst * q.hp) / pool);
+    }
+    p.dealt += done;
+    return done;
 }
 
 /* ---------- Paramètres d'un type ---------- */
@@ -236,8 +354,15 @@ export function typeParams(troops, analysis) {
     for (const [id, card] of Object.entries(troops?.units || {})) {
         if (!id.startsWith('troops/') || !card.detailed) continue;
         const s = cardStats(card);
+        const b = cardStats(card, { base: true });
         const measured = pool.get(card.key);
         params.set(card.key, {
+            // Le type seul, sans talents ni équipement : la référence sur laquelle appliquer le
+            // matériel relevé d'une pile (cf. `pileStats`).
+            base: {
+                unitHp: b.hp, dmgAvg: b.avgDmg, crit: b.crit, counter: b.counter, speed: b.speed,
+                typeLevel: b.typeLevel,
+            },
             key: card.key,
             fr: card.fr || card.name,
             role: card.role?.key || null,
@@ -262,28 +387,141 @@ export function typeParams(troops, analysis) {
     return params;
 }
 
-/** Armée adverse d'un combat passé, reconstruite à partir de données d'avant-combat seulement. */
-function foeArmyFromFight(fight, params, { role }) {
-    const piles = fight.theirPiles.map((p) => {
-        const t = params.get(p.base);
-        // Mêmes règles pour les deux camps : les stats du type (la carte du shop) remises à
-        // l'échelle de ses PV unitaires réels. Les PV sont le seul indicateur de l'équipement et
-        // du niveau de type d'en face que le rapport donne — et la symétrie compte plus que la
-        // précision absolue, puisqu'on compare deux armées entre elles.
-        const dmg = (t?.dmgAvg || 0) * (p.unitHp / (t?.unitHp || p.unitHp));
+/* Une pile d'un combat passé, reconstruite au plus près de ce que le rapport dit vraiment.
+   Trois sources, et chacune à sa place :
+
+   1. **Servi par le serveur** — les PV unitaires. Équipement, talents et bonus de famille d'en
+      face y sont déjà : rien à deviner, et c'est vrai pour les deux camps.
+   2. **Mesuré dans la frise des coups** — la cadence réelle de la pile (`interval` = durée du
+      combat ÷ coups portés). C'est ce qui a le plus fait progresser le rejeu de l'historique
+      (justesse 76,3 → 86,4 %, pouvoir de classement 0,783 → 0,892), parce que les objets donnent
+      un bonus de vitesse intrinsèque que le jeu ne publie pas : les piles qui portent un affixe de
+      vitesse frappent ~10 % plus vite alors que l'affixe n'en promet que 1 à 6,5 %.
+   3. **Carte du shop + équipement relevé** — les stats **de base** du type (sans mes talents ni
+      mon matériel, qui ne sont pas les siens), au niveau de type de la pile, auxquelles on
+      applique les affixes des trois pièces : critique et riposte en points, dégâts en pourcentage.
+      Les dégâts sont ensuite remis à l'échelle des PV unitaires réels de la pile.
+
+   Ce qu'on n'utilise **pas** : les dégâts par coup mesurés (`dpuPerHit`). Ils sont tentants, mais
+   ils incluent les capacités qui augmentent les dégâts pendant le combat (rage, frénésie, dernier
+   carré) que le simulateur réapplique ensuite — on les compterait deux fois. Vérifié sur
+   l'historique : les utiliser fait baisser le pouvoir de classement (0,892 → 0,869). Ils ne servent
+   donc que de repli pour un type dont le jeu ne m'a pas encore servi la fiche (il n'y en a aucun
+   aujourd'hui, mais ça viendra en montant de niveau). */
+const NO_TALENTS = { dmgPct: 0, dmgFlat: 0, critPts: 0, speedPct: 0, hpPct: 0, hpFlat: 0, counterPts: 0, counterPct: 0 };
+
+function pileStats(p, params, { fortAgainstThem = 0, talents = null } = {}) {
+    const t = params.get(p.base);
+    const base = t?.base || null;
+    const gear = p.gearBonuses || { dmg: 0, hp: 0, speed: 0, crit: 0, riposte: 0 };
+    const tal = talents || NO_TALENTS;
+
+    // Repli pour un type sans fiche : les dégâts observés, la fortification du camp visé remise.
+    const observed = Number.isFinite(p.dpuPerHit) && p.hits >= 3
+        ? p.dpuPerHit / (1 - (fortAgainstThem || 0) / 100)
+        : null;
+
+    if (!base) {
         return {
-            key: p.key,
-            qty: p.qty,
-            unitHp: p.unitHp,
-            hp: p.hp,
-            dmgAvg: dmg,
-            crit: t?.crit ?? 10,
-            counter: t?.counter ?? 5,
-            speed: t?.speed ?? 1.5,
-            role: p.role,
-            ability: p.ability,
+            key: p.key, fr: p.base, qty: p.qty, unitHp: p.unitHp, hp: p.hp,
+            dmgAvg: observed ?? 0,
+            dmgSource: observed ? 'mesuré (type sans fiche)' : 'inconnu',
+            crit: 10, counter: 5, speed: p.interval || 1.5, speedSource: p.interval ? 'mesuré' : 'défaut',
+            role: p.role, roleFr: ROLE_FR[p.role] || p.role,
+            ability: p.ability, abilityFr: ABILITY_FR[p.ability] || p.ability,
         };
-    });
+    }
+
+    const lv = atTypeLevel(base, base.typeLevel, p.typeLevel ?? base.typeLevel);
+
+    /* Le jeu compose dans cet ordre — vérifié sur les types que je n'équipe pas, où
+       `(base + plats) × (1 + %)` tombe à 1 % près sur la valeur servie :
+
+           réel = (base_du_type_à_son_niveau + bonus_plats) × (1 + %talents + %objets)
+
+       Les PV unitaires sont connus (le serveur les sert). Ce qu'ils contiennent au-delà des
+       talents et des affixes, c'est le **bonus intrinsèque** des objets, que le jeu ne publie
+       pas. On le déduit du résidu de PV et on l'applique aussi aux dégâts : c'est une
+       approximation, mais elle est symétrique entre les deux camps, et c'est le seul signal
+       disponible sur le matériel d'en face. */
+    const hpExplained = (lv.unitHp + (tal.hpFlat || 0)) * (1 + ((tal.hpPct || 0) + gear.hp) / 100);
+    const intrinsicPct = hpExplained > 0 ? (p.unitHp / hpExplained - 1) * 100 : 0;
+
+    const dmgAvg = (lv.dmgAvg + (tal.dmgFlat || 0))
+        * (1 + ((tal.dmgPct || 0) + gear.dmg + intrinsicPct) / 100);
+
+    return {
+        key: p.key,
+        fr: t?.fr || p.base,
+        qty: p.qty,
+        unitHp: p.unitHp, // servi par le serveur : équipement et talents d'en face compris
+        hp: p.hp,
+        dmgAvg,
+        dmgSource: 'carte + talents + équipement',
+        crit: lv.crit + (tal.critPts || 0) + gear.crit,
+        counter: lv.counter + (tal.counterPts || 0) + gear.riposte,
+        // La cadence mesurée prime : elle intègre les bonus de vitesse que le jeu ne publie pas.
+        speed: p.interval || lv.speed / (1 + ((tal.speedPct || 0) + gear.speed) / 100),
+        speedSource: p.interval ? 'mesuré' : 'carte + talents + équipement',
+        role: p.role,
+        roleFr: ROLE_FR[p.role] || p.role,
+        ability: p.ability,
+        abilityFr: ABILITY_FR[p.ability] || p.ability,
+        intrinsicPct: Math.round(intrinsicPct * 10) / 10,
+    };
+}
+
+/**
+ * Une composition à monter maintenant : `[{ key, qty }]` → armée jouable.
+ *
+ * Les stats viennent des valeurs **réelles** de la carte du shop, qui portent déjà tes talents et
+ * ton équipement du moment — c'est exactement ce que tu alignerais si tu recrutais aujourd'hui.
+ * Surtout ne pas y réappliquer les talents : ils seraient comptés deux fois.
+ */
+export function composeArmy(spec, params, { slots, fort = 0, guard = 0, readiness = 1, critMult = 1.5 } = {}) {
+    const piles = [];
+    const unknown = [];
+    for (const { key, qty } of spec || []) {
+        const t = params.get(key);
+        if (!t) { unknown.push(key); continue; }
+        if (!(qty > 0)) continue;
+        piles.push({
+            key: t.key,
+            fr: t.fr,
+            qty: Math.round(qty),
+            unitHp: t.unitHp,
+            dmgAvg: t.dmgAvg,
+            crit: t.crit,
+            counter: t.counter,
+            speed: t.speed,
+            role: t.role,
+            roleFr: t.roleFr,
+            ability: t.ability,
+            abilityFr: t.abilityFr,
+            cost: t.cost,
+        });
+    }
+    const built = army(piles, { slots, fort, guard, readiness, critMult });
+    built.unknown = unknown;
+    return built;
+}
+
+/** Armée adverse d'un combat passé : son armée exacte, telle que le rapport la donne. */
+export function enemyArmyFromFight(fight, params, opts) {
+    return foeArmyFromFight(fight, params, opts);
+}
+
+/** Ma composition d'alors, pour comparer « ce que j'avais » à « ce que je mettrais ». */
+export function myArmyOfFight(fight, params, opts) {
+    return myArmyFromFight(fight, params, opts);
+}
+
+/* Armée adverse d'un combat passé, reconstruite à partir de données d'avant-combat seulement.
+   Ses talents à lui sont inconnus : ils sont absorbés par le résidu de PV (cf. `pileStats`). */
+function foeArmyFromFight(fight, params, { role }) {
+    // Quand je défends, MES murs rabotaient leurs coups : il faut les retirer de la mesure.
+    const fortAgainstThem = role === 'défense' ? fight.fort.mine || 0 : 0;
+    const piles = fight.theirPiles.map((p) => pileStats(p, params, { fortAgainstThem }));
     // Le seuil de capacité d'en face suit SES places : on l'approche par son armée engagée.
     return army(piles, {
         slots: Math.round(fight.army.theirs.qty / 0.9),
@@ -292,38 +530,28 @@ function foeArmyFromFight(fight, params, { role }) {
     });
 }
 
-/** Mon armée telle qu'elle était dans un combat passé (mêmes règles de reconstruction). */
-function myArmyFromFight(fight, params) {
-    const piles = fight.myPiles.map((p) => {
-        const t = params.get(p.base);
-        const scale = t ? p.unitHp / (t.unitHp || p.unitHp) : 1;
-        return {
-            key: p.key,
-            qty: p.qty,
-            unitHp: p.unitHp,
-            hp: p.hp,
-            dmgAvg: (t?.dmgAvg || 0) * scale,
-            crit: t?.crit ?? 10,
-            counter: t?.counter ?? 5,
-            speed: t?.speed ?? 1.5,
-            role: p.role,
-            ability: p.ability,
-        };
-    });
+/** Mon armée telle qu'elle était dans un combat passé — mes talents, eux, sont connus. */
+function myArmyFromFight(fight, params, { talents = null, critMult } = {}) {
+    // Quand j'attaquais, SES murs rabotaient mes coups.
+    const fortAgainstThem = fight.role === 'attaque' ? fight.fort.theirs || 0 : 0;
+    const piles = fight.myPiles.map((p) => pileStats(p, params, { fortAgainstThem, talents }));
     return army(piles, {
         slots: Math.round((fight.abNeed || Math.ceil(fight.army.mine.qty * 0.1)) * 10),
         fort: fight.role === 'défense' ? fight.fort.mine : 0,
         guard: fight.role === 'défense' ? fight.guard : 0,
+        critMult,
     });
 }
 
 /* ---------- Validation : rejouer l'historique ---------- */
 
-export function backtest(analysis, troops) {
+export function backtest(analysis, troops, { skills = null, critMult = null } = {}) {
     const params = typeParams(troops, analysis);
+    const talents = skills?.bonuses || null;
+    const crit = critMult ?? myCritMultiplier(skills);
     const rows = [];
     for (const f of analysis.fights) {
-        const mine = myArmyFromFight(f, params);
+        const mine = myArmyFromFight(f, params, { talents, critMult: crit });
         const theirs = foeArmyFromFight(f, params, { role: f.role });
         const res = simulate(mine, theirs);
         rows.push({ id: f.id, role: f.role, actual: f.won, predicted: res.winner === 'A', margin: res.margin });
@@ -356,8 +584,36 @@ export function backtest(analysis, troops) {
         baseline: round1((100 * Math.max(rows.filter((r) => r.actual).length, rows.filter((r) => !r.actual).length)) / rows.length),
         attack: byRole('attaque'),
         defense: byRole('défense'),
+        talents: talents ? { applied: true, ...talents } : { applied: false },
+        critMult: crit,
         rows,
     };
+}
+
+/* Multiplicateur de critique de mon camp. Le jeu part de ×1,5 et le talent « Executioner »
+   annonce `+50% critical damage` : le libellé ne dit pas si la prime passe de +50 % à +100 %
+   (×2,0) ou si les dégâts critiques eux-mêmes gagnent 50 % (×2,25). On ne tranche pas au
+   jugé — `calibrateCrit()` laisse l'historique choisir. */
+export function myCritMultiplier(skills, mode = 'bonus') {
+    const pct = (skills?.bonuses?.critDmgPct || 0) / 100;
+    return mode === 'total' ? 1.5 * (1 + pct) : 1.5 + pct;
+}
+
+/** Rejoue l'historique avec chaque interprétation et renvoie celle qui classe le mieux. */
+export function calibrateCrit(analysis, troops, skills) {
+    const candidates = [
+        { mode: 'aucun', critMult: 1.5 },
+        { mode: 'bonus', critMult: myCritMultiplier(skills, 'bonus') },
+        { mode: 'total', critMult: myCritMultiplier(skills, 'total') },
+    ];
+    const tried = candidates.map((c) => {
+        const bt = backtest(analysis, troops, { skills, critMult: c.critMult });
+        return { ...c, accuracy: bt.accuracy, auc: bt.separation, balanced: bt.balanced.all.balanced };
+    });
+    // On classe sur l'AUC : c'est la mesure indépendante du seuil, donc la moins sujette au
+    // sur-ajustement sur un historique encore court.
+    const best = tried.slice().sort((a, b) => (b.auc ?? 0) - (a.auc ?? 0) || b.balanced - a.balanced)[0];
+    return { best, tried };
 }
 
 /** Justesse équilibrée et pouvoir de classement, par rôle : c'est là qu'on voit où croire le modèle. */
@@ -420,7 +676,7 @@ const round1 = (n) => Math.round(n * 10) / 10;
  * @param slots places de troupes disponibles
  * @param maxTypes emplacements de types (4, ou 5 avec l'Annexe)
  */
-export function recommend({ analysis, troops, slots, maxTypes = 4, keep = 8, threshold = {}, readiness = {} }) {
+export function recommend({ analysis, troops, slots, maxTypes = 4, keep = 8, threshold = {}, readiness = {}, critMult = 1.5 }) {
     const params = typeParams(troops, analysis);
     const usable = [...params.values()].filter((t) => t.dmgAvg > 0 && t.unitHp > 0);
     if (!usable.length) return { empty: true, reason: 'Aucune fiche de troupe chiffrée : lance « Relever les troupes ».' };
@@ -441,7 +697,7 @@ export function recommend({ analysis, troops, slots, maxTypes = 4, keep = 8, thr
     }
 
     // Premier tri sur un échantillon d'adversaires représentatifs, puis affinage sur tout l'historique.
-    const opts = { threshold, readiness };
+    const opts = { threshold, readiness, critMult };
     const scored = candidates.map((piles) => ({ piles, score: score(piles, screen, slots, opts) }));
     scored.sort((a, b) => b.score.margin - a.score.margin);
 
@@ -460,8 +716,8 @@ export function recommend({ analysis, troops, slots, maxTypes = 4, keep = 8, thr
         need: Math.ceil(slots * 0.1),
         scenarios: scenarios.length,
         screened: candidates.length,
-        best: finalists.slice(0, keep).map((f) => describe(f, slots, scenarios.length)),
-        current: current ? describe({ piles: current, score: score(current, scenarios, slots, opts) }, slots, scenarios.length) : null,
+        best: finalists.slice(0, keep).map((f) => describe(f, slots, scenarios.length, critMult)),
+        current: current ? describe({ piles: current, score: score(current, scenarios, slots, opts) }, slots, scenarios.length, critMult) : null,
         pool: scenarios.map((s) => ({ name: s.name, role: s.role, hp: s.army.maxHp, weight: s.weight })),
     };
 }
@@ -488,13 +744,13 @@ function buildScenarios(analysis, params) {
     return out;
 }
 
-function score(piles, scenarios, slots, { threshold = {}, readiness = {} } = {}) {
+function score(piles, scenarios, slots, { threshold = {}, readiness = {}, critMult = 1.5 } = {}) {
     let wins = 0;
     let margin = 0;
     let weight = 0;
     for (const s of scenarios) {
         const ready = s.role === 'défense' ? (readiness.defense ?? 1) : (readiness.attack ?? 1);
-        const mine = army(piles, { slots, fort: s.myFort, guard: s.myGuard, readiness: ready });
+        const mine = army(piles, { slots, fort: s.myFort, guard: s.myGuard, readiness: ready, critMult });
         const res = simulate(mine, s.army);
         if (res.margin > (threshold[s.role] ?? 0)) wins += s.weight;
         margin += res.margin * s.weight;
@@ -533,10 +789,11 @@ function refine(start, scenarios, slots, opts) {
     return best;
 }
 
-function describe({ piles, score: s }, slots, nScenarios) {
+function describe({ piles, score: s }, slots, nScenarios, critMult = 1.5) {
     const need = Math.ceil(slots * 0.1);
     const used = piles.reduce((a, p) => a + p.qty, 0);
-    const dps = piles.reduce((a, p) => a + p.qty * p.dmgAvg * (1 + p.crit / 200) / p.speed, 0);
+    // Espérance de dégâts par seconde, prime de critique comprise au vrai multiplicateur.
+    const dps = piles.reduce((a, p) => a + p.qty * p.dmgAvg * (1 + (p.crit / 100) * (critMult - 1)) / p.speed, 0);
     const hp = piles.reduce((a, p) => a + p.qty * p.unitHp, 0);
     const cost = {};
     for (const p of piles) {

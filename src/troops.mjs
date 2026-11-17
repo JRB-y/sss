@@ -19,7 +19,7 @@ const CATEGORIES = ['troops', 'girls', 'narcos'];
 /* Les 21 types de troupes dans l'ordre du shop. Niveaux de déblocage et rôles relevés sur
    https://ssandsun.com/fr/regles — c'est la seule source pour les types encore verrouillés
    (le jeu, lui, confirme le niveau requis dès qu'une carte est masquée). */
-const ROSTER = [
+export const ROSTER = [
     { key: 'mauviette', fr: 'Junkie', level: 1, role: 'fast' },
     { key: 'racaille', fr: 'Racaille', level: 1, role: 'guard' },
     { key: 'lascar', fr: 'Lascar', level: 1, role: 'heavy' },
@@ -43,7 +43,7 @@ const ROSTER = [
     { key: 'escobarre', fr: 'Pablo Escobarre', level: 68, role: 'allround' },
 ];
 
-const ROLE_FR = {
+export const ROLE_FR = {
     fast: 'Rapide',
     guard: 'Défenseur',
     heavy: 'Cogneur',
@@ -201,6 +201,7 @@ function readCard(html, cat) {
         preview: secret && Object.keys(stats).length > 1,
         requiresLevel: requires ?? (cat === 'troops' ? ROSTER.find((r) => r.key === key)?.level ?? null : null),
         typeLevel: num(grab(html, /<span class="card-lv[^"]*"[^>]*>Lv\.\s*(\d+)/)) ?? (stats.typeLevel?.base ?? null),
+        typeXp: readTypeXp(html),
         owned: num(grab(html, /<span class="card-owned"[^>]*>×([\d\s,.]+)</)),
         description: text(grab(html, /<p class="unit-desc" data-unit-desc>([\s\S]*?)<\/p>/)),
         role: readRole(html),
@@ -209,6 +210,28 @@ function readCard(html, cat) {
         stats,
         cost: readCost(html),
         image: attr(html, 'src'),
+    };
+}
+
+/* Progression du niveau de type. L'info-bulle de la pastille « Lv. N » porte la seule mesure que
+   le jeu donne de l'XP d'un type : « 7 911 / 27 134 XP to level 4 ». Elle permet de savoir
+   combien il reste avant le prochain palier — et donc avant les +2 % de vie et de dégâts
+   suivants, qui valent pour TOUTES les unités de ce type. */
+function readTypeXp(html) {
+    const raw = grab(html, /<span class="card-lv[^"]*"[\s\S]*?<span class="stat-tip"[^>]*>([\s\S]*?)<\/span>/);
+    if (!raw) return null;
+    // L'info-bulle s'ouvre sur « <b>Type level 3</b> » : son chiffre collerait au compteur d'XP.
+    const tip = text(raw.replace(/<b>[\s\S]*?<\/b>/, ' '));
+    const m = /([\d.,\s  ]+)\s*\/\s*([\d.,\s  ]+)\s*XP/i.exec(tip);
+    if (!m) return { maxed: /max/i.test(tip) || null };
+    const xp = num(m[1]);
+    const next = num(m[2]);
+    return {
+        xp,
+        next,
+        remaining: Number.isFinite(xp) && Number.isFinite(next) ? next - xp : null,
+        pct: Number.isFinite(xp) && next ? Math.round((1000 * xp) / next) / 10 : null,
+        toLevel: num(/to level\s*(\d+)/i.exec(tip)?.[1]),
     };
 }
 
@@ -319,7 +342,7 @@ function renderTroopsDoc(store) {
     out.push('- **Critique** — chance qu’un coup soit critique : tout le groupe frappe alors ×1,5.');
     out.push('- **Riposte** — chance que le groupe frappé rende le coup à 60 % de ses dégâts (toutes les unités touchées d’un coup).');
     out.push('- **Vitesse** — délai entre deux coups : plus il est court, plus l’unité frappe souvent.');
-    out.push('- **Niveau de type** — chaque type gagne de l’XP en combat jusqu’au niveau 50 : **+2 % de dégâts et de vie par niveau**, pour toutes tes unités de ce type.');
+    out.push('- **Niveau de type** — chaque type gagne de l’XP en combat jusqu’au niveau 50 : **+2 % de dégâts et de vie par niveau**, pour toutes tes unités de ce type. Le bonus est **additif** et non composé : au niveau *n*, une unité vaut `base × (1 + 2 % × (n − 1))`. Vérifié sur l’historique à équipement constant — un modèle composé dérive dès le niveau 3.');
     out.push('');
     out.push('Deux colonnes de valeurs pour chaque stat :', '');
     out.push('- **base** — le type seul, à son niveau de type actuel, sans talents ni équipement (l’interrupteur « Stats de base » du shop) ;');
@@ -376,6 +399,11 @@ function renderTroopsDoc(store) {
         out.push(`**Niveau requis** ${r.level} · **Rôle** ${ROLE_FR[u.role?.key || r.role]}`
             + ` · **Capacité** ${u.ability?.fr || u.ability?.name || '—'}`
             + ` · **Niveau de type** ${u.typeLevel ?? '—'}${u.owned ? ` · **Possédées** ${u.owned}` : ''}`, '');
+        if (u.typeXp?.next) {
+            out.push(`*Progression du type : ${fr(u.typeXp.xp)} / ${fr(u.typeXp.next)} XP (${pct(u.typeXp.pct)} %)`
+                + ` avant le niveau ${u.typeXp.toLevel} — il reste ${fr(u.typeXp.remaining)} XP à gagner en combat,`
+                + ' et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*', '');
+        }
         if (u.preview) {
             out.push('> 👁 **Avant-première** — type encore verrouillé : le jeu en donne les chiffres mais '
                 + 'pas le rôle ni la capacité.', '');

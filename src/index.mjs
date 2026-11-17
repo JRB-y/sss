@@ -4,6 +4,7 @@ import { runChecks } from './checks.mjs';
 import { syncFights } from './fights.mjs';
 import { explore } from './explore.mjs';
 import { syncTroops } from './troops.mjs';
+import { syncSkills } from './skills.mjs';
 import { exportRules } from './rules.mjs';
 import { serve } from './server.mjs';
 import { log } from './util.mjs';
@@ -14,9 +15,14 @@ Usage : node --env-file-if-exists=.env src/index.mjs <commandes> [options]
 Commandes
   check      connexion + vérifications (DOM, API, console, réseau) → out/report.json
   fights     télécharge les combats de la fenêtre courante, nouveaux uniquement → data/fights.json
+             (reprojette aussi les adversaires et les objets, sauf avec --no-project)
+  enemies    (re)construit les fiches d'adversaires et le catalogue d'objets depuis les combats
+             déjà en base → data/enemies.json, data/items.json, docs/objets.md (sans connexion)
   explore    dépose les réponses brutes du jeu dans data/raw/ (debug / calibrage)
   rules      convertit les règles publiques du site en Markdown → docs/regles.md
   troops     relève les stats des 21 types de troupes → data/troops.json + docs/troupes.md
+  skills     relève ton arbre de talents → data/skills.json (il sépare talents et équipement)
+  assets     télécharge les images du jeu (troupes, objets, avatars) → data/assets/ (sans connexion)
   analyse    analyse l'historique de combats dans le terminal → out/analysis.json
   ui         ouvre l'interface locale (docs, analyse, compositions) sur http://127.0.0.1:4173
 
@@ -27,6 +33,8 @@ Options
   --refresh   retélécharge le détail de TOUS les combats, pas seulement les nouveaux
   --raw       garde aussi le HTML des listes dans data/raw/
   --headed    ouvre un navigateur visible
+  --no-project  « fights » n'enchaîne pas sur la reprojection des adversaires
+  --force     « assets » retélécharge toutes les images, même celles déjà en local
 `.trim();
 
 const argv = process.argv.slice(2);
@@ -39,7 +47,7 @@ if (flags.has('--help') || flags.has('-h') || commands.length === 0) {
 }
 if (flags.has('--headed')) config.headed = true;
 
-const known = new Set(['check', 'fights', 'explore', 'rules', 'troops', 'analyse', 'ui']);
+const known = new Set(['check', 'fights', 'enemies', 'assets', 'explore', 'rules', 'troops', 'skills', 'analyse', 'ui']);
 const unknown = commands.filter((c) => !known.has(c));
 if (unknown.length) {
     console.error(`Commande inconnue : ${unknown.join(', ')}\n\n${USAGE}`);
@@ -53,6 +61,31 @@ if (commands.includes('rules')) {
     const locale = (argv.find((a) => a.startsWith('--locale=')) || '').slice('--locale='.length) || 'fr';
     try {
         await exportRules({ locale });
+    } catch (e) {
+        log.fail(e.message);
+        if (process.env.SSS_DEBUG === '1') console.error(e);
+        exitCode = 1;
+    }
+}
+
+/* `enemies` est une projection des combats déjà en base : ni navigateur, ni compte. On la traite
+   avant `analyse` pour qu'un `enemies analyse` enchaîné parte des fiches fraîches. */
+if (commands.includes('enemies')) {
+    try {
+        const { syncEnemies } = await import('./enemies.mjs');
+        await syncEnemies();
+    } catch (e) {
+        log.fail(e.message);
+        if (process.env.SSS_DEBUG === '1') console.error(e);
+        exitCode = 1;
+    }
+}
+
+/* `assets` ne tape que des URLs publiques (images, sprite) : pas de navigateur, pas de compte. */
+if (commands.includes('assets')) {
+    try {
+        const { syncAssets } = await import('./assets.mjs');
+        await syncAssets({ force: flags.has('--force') });
     } catch (e) {
         log.fail(e.message);
         if (process.env.SSS_DEBUG === '1') console.error(e);
@@ -78,7 +111,7 @@ if (commands.includes('ui')) {
     await new Promise(() => {}); // le serveur tourne jusqu'au Ctrl+C
 }
 
-const needsGame = commands.some((c) => !['rules', 'analyse', 'ui'].includes(c));
+const needsGame = commands.some((c) => !['rules', 'analyse', 'enemies', 'assets', 'ui'].includes(c));
 if (!needsGame) process.exit(exitCode);
 
 const session = await GameSession.open({ fresh: flags.has('--fresh') });
@@ -97,10 +130,18 @@ try {
             if (!ok) exitCode = 1;
         }
         if (command === 'fights') {
-            const res = await syncFights(session, { refresh: flags.has('--refresh'), keepRaw: flags.has('--raw') });
+            const res = await syncFights(session, {
+                refresh: flags.has('--refresh'),
+                keepRaw: flags.has('--raw'),
+                project: !flags.has('--no-project'),
+            });
             if (res.failed) exitCode = 1;
+            // Un trou dans la fenêtre n'est pas une panne du script, mais ça ne doit pas passer
+            // inaperçu dans un cron : on le remonte par le code de sortie.
+            if (res.holes?.length) exitCode = 1;
         }
         if (command === 'troops') await syncTroops(session, { keepRaw: flags.has('--raw') });
+        if (command === 'skills') await syncSkills(session, { keepRaw: flags.has('--raw') });
         if (command === 'explore') await explore(session);
     }
 } catch (e) {
@@ -117,12 +158,13 @@ process.exit(exitCode);
 
 async function reportAnalysis() {
     const { loadAnalysis } = await import('./analyse.mjs');
-    const { backtest, recommend } = await import('./sim.mjs');
+    const { backtest, recommend, calibrateCrit } = await import('./sim.mjs');
     const { readJson, writeJson } = await import('./util.mjs');
 
     const analysis = await loadAnalysis();
     if (analysis.empty) throw new Error(analysis.reason);
     const troops = await readJson(config.paths.troops);
+    const skills = await readJson(config.paths.skills);
 
     log.title(`Historique — ${analysis.record.fights} combats`);
     const r = analysis.record;
@@ -136,9 +178,19 @@ async function reportAnalysis() {
     }
 
     if (troops) {
-        const bt = backtest(analysis, troops);
+        // Le multiplicateur de critique dépend du talent « Executioner », dont le libellé est
+        // ambigu : on laisse l'historique choisir l'interprétation plutôt que de la décréter.
+        const crit = skills ? calibrateCrit(analysis, troops, skills).best : null;
+        const bt = backtest(analysis, troops, { skills, critMult: crit?.critMult });
         log.title('Simulateur');
         log.info(`rejoue l'historique : ${bt.correct}/${bt.fights} bons vainqueurs (${bt.accuracy} %), AUC ${bt.separation}`);
+        if (skills) {
+            log.dim(`talents appliqués : +${skills.bonuses.dmgPct} % de dégâts, +${skills.bonuses.dmgFlat} par coup, `
+                + `+${skills.bonuses.critPts} pts de critique, +${skills.bonuses.speedPct} % de vitesse, `
+                + `+${skills.bonuses.hpPct} % de vie · critique ×${crit.critMult}`);
+        } else {
+            log.warn('arbre de talents inconnu : lance « npm run skills » pour que le simulateur en tienne compte.');
+        }
 
         const slots = troops.crew?.slots || r.fights;
         const rec = recommend({
@@ -147,6 +199,7 @@ async function reportAnalysis() {
             keep: 5,
             threshold: bt.threshold,
             readiness: { attack: 1, defense: 0.7 },
+            critMult: bt.critMult,
         });
         if (!rec.empty) {
             log.title(`Compositions (${slots} places, ${rec.maxTypes} types, seuil de capacité ${rec.need})`);

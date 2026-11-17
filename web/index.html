@@ -25,10 +25,14 @@
 
     <nav class="nav" aria-label="Sections">
       <a href="#tableau" data-view="tableau"><i class="dot"></i>Tableau de bord</a>
+      <a href="#analyse" data-view="analyse"><i class="dot"></i>Analyse des combats</a>
+      <a href="#adversaires" data-view="adversaires"><i class="dot"></i>Adversaires</a>
+      <a href="#simulateur" data-view="simulateur"><i class="dot"></i>Simulateur</a>
+      <a href="#compos" data-view="compos"><i class="dot"></i>Compositions</a>
+      <span class="nav-sep">Documentation</span>
       <a href="#regles" data-view="regles"><i class="dot"></i>Les règles</a>
       <a href="#troupes" data-view="troupes"><i class="dot"></i>Les troupes</a>
-      <a href="#analyse" data-view="analyse"><i class="dot"></i>Analyse des combats</a>
-      <a href="#compos" data-view="compos"><i class="dot"></i>Compositions</a>
+      <a href="#objets" data-view="objets"><i class="dot"></i>Les objets</a>
     </nav>
 
     <div class="rail-foot">
@@ -44,41 +48,42 @@
       <header class="view-head">
         <p class="kicker">État des lieux</p>
         <h1>Tableau de bord</h1>
-        <p class="lede">Tout part d’ici : récupérer les combats que le jeu expose encore, les analyser,
-          puis chercher la composition qui gagne plus souvent qu’elle ne perd.</p>
+        <p class="lede">Un seul geste : <strong>mettre à jour</strong>. Le reste de l’interface se
+          calcule tout seul à partir de ce qui est en base — l’analyse, les fiches d’adversaires et
+          les compositions n’ont jamais besoin du jeu.</p>
       </header>
 
-      <section class="actions" aria-label="Actions">
-        <button class="act act-primary" data-action="fetch-fights">
-          <span class="act-no">01</span>
-          <span class="act-body"><strong>Récupérer les combats</strong>
-            <em>Se connecte au jeu et télécharge ceux qui manquent en base</em></span>
-        </button>
-        <button class="act" data-action="analyse">
-          <span class="act-no">02</span>
-          <span class="act-body"><strong>Analyser</strong>
-            <em>Bilan, rendement par type, capacités gaspillées, vivier adverse</em></span>
-        </button>
-        <button class="act" data-action="compos">
-          <span class="act-no">03</span>
-          <span class="act-body"><strong>Proposer une composition</strong>
-            <em>Cherche la compo qui gagne le plus contre les adversaires déjà rencontrés</em></span>
-        </button>
-      </section>
-
-      <section class="actions actions-minor" aria-label="Mises à jour">
-        <button class="act act-small" data-action="fetch-troops">
-          <span class="act-body"><strong>Relever les troupes</strong><em>Stats, capacités et coûts depuis le shop</em></span>
-        </button>
-        <button class="act act-small" data-action="fetch-rules">
-          <span class="act-body"><strong>Régénérer les règles</strong><em>Reconvertit la page officielle en Markdown</em></span>
-        </button>
-        <button class="act act-small" data-action="fetch-fights-refresh">
-          <span class="act-body"><strong>Tout retélécharger</strong><em>Reprend le détail de chaque combat</em></span>
+      <section class="actions" aria-label="Mise à jour">
+        <button class="act act-primary act-wide" data-action="update-all">
+          <span class="act-no">↻</span>
+          <span class="act-body"><strong>Mettre à jour</strong>
+            <em>Se connecte au jeu, reprend les combats là où le dernier passage s’était arrêté,
+              relève tes troupes, puis reconstruit les fiches d’adversaires et le catalogue d’objets</em></span>
         </button>
       </section>
 
       <div id="dash-summary"></div>
+
+      <details class="more" id="dash-more">
+        <summary>Actions détaillées</summary>
+        <section class="actions actions-minor" aria-label="Actions détaillées">
+          <button class="act act-small" data-action="fetch-fights">
+            <span class="act-body"><strong>Combats seulement</strong><em>Reprend l’historique sans toucher aux troupes</em></span>
+          </button>
+          <button class="act act-small" data-action="fetch-troops">
+            <span class="act-body"><strong>Troupes seulement</strong><em>Stats, capacités et coûts depuis le shop</em></span>
+          </button>
+          <button class="act act-small" data-action="rebuild-enemies">
+            <span class="act-body"><strong>Reconstruire les fiches</strong><em>Reprojette adversaires et objets, sans connexion</em></span>
+          </button>
+          <button class="act act-small" data-action="fetch-rules">
+            <span class="act-body"><strong>Régénérer les règles</strong><em>Reconvertit la page officielle en Markdown</em></span>
+          </button>
+          <button class="act act-small" data-action="fetch-fights-refresh">
+            <span class="act-body"><strong>Tout retélécharger</strong><em>Reprend le détail de chaque combat archivé</em></span>
+          </button>
+        </section>
+      </details>
     </div>
 
     <div class="view doc-view" id="view-regles" hidden>
@@ -95,6 +100,23 @@
       </div>
     </div>
 
+    <div class="view doc-view" id="view-objets" hidden>
+      <div class="doc-shell">
+        <aside class="doc-toc" aria-label="Sommaire"><div class="toc-inner"></div></aside>
+        <article class="doc prose"></article>
+      </div>
+    </div>
+
+    <div class="view" id="view-adversaires" hidden>
+      <header class="view-head">
+        <p class="kicker">Qui tu affrontes, et ce qu’il porte</p>
+        <h1>Adversaires</h1>
+        <p class="lede">Une fiche par joueur croisé, reconstruite à partir des rapports de combat :
+          son armée, ses objets, et la date de chaque fois où il a changé de troupes.</p>
+      </header>
+      <div id="adversaires-body"><p class="empty">Chargement…</p></div>
+    </div>
+
     <div class="view" id="view-analyse" hidden>
       <header class="view-head">
         <p class="kicker">Mesuré, pas estimé</p>
@@ -102,6 +124,17 @@
         <p class="lede">Chiffres lus dans les rapports de combat du jeu : rien n’est extrapolé ici.</p>
       </header>
       <div id="analyse-body"><p class="empty">Clique sur <strong>Analyser</strong> depuis le tableau de bord.</p></div>
+    </div>
+
+    <div class="view" id="view-simulateur" hidden>
+      <header class="view-head">
+        <p class="kicker">Combat à blanc</p>
+        <h1>Simulateur</h1>
+        <p class="lede">Choisis un adversaire de ton historique — son armée exacte, son équipement,
+          ses fortifications — puis monte la composition que tu veux lui opposer et regarde le combat
+          se dérouler. Rien n’est envoyé au jeu.</p>
+      </header>
+      <div id="simu-body"><p class="empty">Chargement…</p></div>
     </div>
 
     <div class="view" id="view-compos" hidden>

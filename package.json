@@ -6,7 +6,11 @@
   "description": "Checks de santé du compte ssandsun.com/play + export incrémental de l'historique de combats (Playwright)",
   "scripts": {
     "check": "node --env-file-if-exists=.env src/index.mjs check",
+    "update": "node --env-file-if-exists=.env src/index.mjs fights troops skills assets",
+    "skills": "node --env-file-if-exists=.env src/index.mjs skills",
     "fights": "node --env-file-if-exists=.env src/index.mjs fights",
+    "enemies": "node --env-file-if-exists=.env src/index.mjs enemies",
+    "assets": "node --env-file-if-exists=.env src/index.mjs assets",
     "explore": "node --env-file-if-exists=.env src/index.mjs explore",
     "rules": "node --env-file-if-exists=.env src/index.mjs rules",
     "troops": "node --env-file-if-exists=.env src/index.mjs troops",

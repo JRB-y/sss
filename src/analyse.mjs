@@ -1,5 +1,6 @@
 import { config } from './config.mjs';
 import { readJson } from './util.mjs';
+import { readGear, gearBonuses } from './gear.mjs';
 
 /* Analyse de l'historique de combats — uniquement du mesuré, rien de modélisé.
 
@@ -108,32 +109,42 @@ function readFight(id, entry, report, meId) {
         hits[me][from] = (hits[me][from] || 0) + 1;
         const qty = alive || report[me].piles.find((p) => p.key === from)?.qty || 0;
         if (qty) (dpu[me][from] ||= []).push(dmg / qty);
-        if (counter) {
-            taken[me][from] = (taken[me][from] || 0) + counter;
-            // La riposte est portée par la cible : on la compte dans ses dégâts infligés.
-            taken[foe][to] = taken[foe][to];
-        }
+        // La riposte est portée par la cible et encaissée par l'attaquant du coup.
+        if (counter) taken[me][from] = (taken[me][from] || 0) + counter;
     }
 
-    const pile = (side, p) => ({
-        key: p.key,
-        base: p.key.replace(/@.*/, ''),
-        name: p.name,
-        owner: p.owner || null,
-        qty: p.qty,
-        unitHp: p.unitHp,
-        hp: p.hp,
-        max: p.max,
-        typeLevel: p.level,
-        role: p.role,
-        ability: p.ability,
-        dealt: p.dealt,
-        taken: taken[side][p.key] || 0,
-        hits: hits[side][p.key] || 0,
-        dpuPerHit: median(dpu[side][p.key] || []),
-        gear: (p.gear || []).map((g) => ({ item: g.item, name: g.name, rarity: g.r, bonuses: g.axl || [] })),
-        reinforcement: Boolean(p.owner),
-    });
+    const pile = (side, p) => {
+        const gear = readGear(p.gear);
+        const nHits = hits[side][p.key] || 0;
+        return {
+            key: p.key,
+            base: p.key.replace(/@.*/, ''),
+            name: p.name,
+            owner: p.owner || null,
+            qty: p.qty,
+            unitHp: p.unitHp,
+            hp: p.hp,
+            max: p.max,
+            typeLevel: p.level,
+            role: p.role,
+            ability: p.ability,
+            dealt: p.dealt,
+            taken: taken[side][p.key] || 0,
+            hits: nHits,
+            dpuPerHit: median(dpu[side][p.key] || []),
+            // Cadence mesurée : durée du combat ÷ coups portés. Approchée si la pile tombe tôt,
+            // donc on exige quelques coups avant de la publier.
+            interval: nHits >= 3 && cs ? cs / nHits / 100 : null,
+            gear: gear.map((g) => ({
+                slot: g.slot, slotFr: g.slotFr, item: g.item, name: g.name,
+                rarity: g.rarity, rarityFr: g.rarityFr, affixes: g.affixes, bonuses: g.labels,
+            })),
+            // Somme des affixes des trois emplacements : le seul bonus d'équipement que le jeu
+            // chiffre explicitement, et la seule fenêtre sur le matériel d'en face.
+            gearBonuses: gearBonuses(gear),
+            reinforcement: Boolean(p.owner),
+        };
+    };
 
     const myPiles = report[mine].piles.map((p) => pile(mine, p));
     const theirPiles = report[theirs].piles.map((p) => pile(theirs, p));
@@ -146,7 +157,10 @@ function readFight(id, entry, report, meId) {
         won: report.result?.winner === mine,
         cs,
         seconds: cs / 100,
-        opponent: { id: report[theirs].id, name: report[theirs].name, level: report[theirs].level },
+        opponent: {
+            id: report[theirs].id, name: report[theirs].name,
+            level: report[theirs].level, avatar: report[theirs].avatar || null,
+        },
         myLevel: report[mine].level,
         fort: { mine: report[mine].fort || 0, theirs: report[theirs].fort || 0 },
         guard: report.result?.guard || 0,
@@ -243,9 +257,13 @@ function myTypes(rows, troops) {
             const e = acc.get(p.base) || {
                 key: p.base, role: p.role, ability: p.ability, fights: 0, qty: [], dealt: 0, taken: 0,
                 hits: 0, cs: 0, dpu: [], wins: 0, abilityFired: 0, underThreshold: 0, needs: [],
-                armyDealt: 0, share: [],
+                armyDealt: 0, share: [], levels: [], levelAt: new Map(),
             };
             e.fights += 1;
+            if (Number.isFinite(p.typeLevel)) {
+                e.levels.push(p.typeLevel);
+                e.levelAt.set(r.at, p.typeLevel);
+            }
             e.qty.push(p.qty);
             e.dealt += p.dealt;
             e.taken += p.taken;
@@ -292,29 +310,48 @@ function myTypes(rows, troops) {
             abilityFireRate: pct(e.abilityFired, e.fights),
             underThreshold: e.underThreshold,
             needMedian: median(e.needs),
+            // Le niveau de type vaut +2 % de vie et de dégâts par palier, sur TOUTES les unités du
+            // type. Les moyennes ci-dessus mélangent donc des combats menés à des niveaux
+            // différents : on publie l'amplitude pour qu'on sache de combien.
+            typeLevel: levelSpan(e),
             // Stats de la carte du shop : c'est ce que vaut le type aujourd'hui, équipement compris.
             card: card ? cardStats(card) : null,
         };
     }).sort((a, b) => b.dealt - a.dealt);
 }
 
-export function cardStats(card) {
+/**
+ * Stats chiffrées d'une carte du shop.
+ *
+ * Deux lectures, et il ne faut jamais les confondre :
+ * — `cardStats(card)` donne les stats **réelles** (interrupteur éteint dans le shop) : tes talents
+ *   et ton équipement du moment y sont déjà. C'est ce qu'il faut pour juger une composition que tu
+ *   pourrais aligner aujourd'hui ;
+ * — `cardStats(card, { base: true })` donne le **type seul**, sans talents ni matériel. C'est la
+ *   référence à laquelle appliquer l'équipement relevé d'une pile (`applyGear`), le tien d'hier
+ *   comme celui d'en face — sinon on compterait deux fois les bonus.
+ */
+export function cardStats(card, { base = false } = {}) {
     const s = card.stats || {};
-    const dmg = s.damage?.effective || s.damage?.base;
+    const pick = (stat) => (base
+        ? (stat?.base ?? stat?.effective)
+        : (stat?.effective ?? stat?.base));
+    const dmg = pick(s.damage);
     const avgDmg = dmg && typeof dmg === 'object' ? (dmg.min + dmg.max) / 2 : dmg || 0;
+    const crit = pick(s.crit) ?? 0;
+    const speed = pick(s.speed) ?? 1;
     return {
-        hp: s.hp?.effective ?? s.hp?.base ?? 0,
+        hp: pick(s.hp) ?? 0,
         dmgMin: dmg?.min ?? avgDmg,
         dmgMax: dmg?.max ?? avgDmg,
         avgDmg,
-        crit: s.crit?.effective ?? s.crit?.base ?? 0,
-        counter: s.counter?.effective ?? s.counter?.base ?? 0,
-        speed: s.speed?.effective ?? s.speed?.base ?? 1,
+        crit,
+        counter: pick(s.counter) ?? 0,
+        speed,
         typeLevel: card.typeLevel ?? 1,
         // Dégâts attendus par unité et par coup, espérance de critique comprise (×1,5).
-        expectedHit: avgDmg * (1 + (s.crit?.effective ?? s.crit?.base ?? 0) / 100 * 0.5),
-        dpsPerUnit: (avgDmg * (1 + (s.crit?.effective ?? s.crit?.base ?? 0) / 100 * 0.5))
-            / (s.speed?.effective ?? s.speed?.base ?? 1),
+        expectedHit: avgDmg * (1 + (crit / 100) * 0.5),
+        dpsPerUnit: (avgDmg * (1 + (crit / 100) * 0.5)) / (speed || 1),
         cost: card.cost || {},
     };
 }
@@ -361,12 +398,25 @@ function opponents(rows) {
         for (const p of r.theirPiles) {
             const e = acc.get(p.base) || {
                 key: p.base, role: p.role, ability: p.ability, fights: 0, qty: [], unitHp: [], dpu: [],
-                hits: 0, cs: 0, reinf: 0,
+                hits: 0, cs: 0, reinf: 0, intervals: [], bonuses: [], items: new Map(),
+                levels: [], levelAt: new Map(),
             };
             e.fights += 1;
+            if (Number.isFinite(p.typeLevel)) {
+                e.levels.push(p.typeLevel);
+                e.levelAt.set(r.at, p.typeLevel);
+            }
             e.qty.push(p.qty);
             e.unitHp.push(p.unitHp);
             if (Number.isFinite(p.dpuPerHit)) e.dpu.push(p.dpuPerHit);
+            if (Number.isFinite(p.interval)) e.intervals.push(p.interval);
+            e.bonuses.push(p.gearBonuses || {});
+            for (const g of p.gear || []) {
+                const k = `${g.slot}/${g.item}`;
+                const it = e.items.get(k) || { slot: g.slot, slotFr: g.slotFr, item: g.item, name: g.name, n: 0 };
+                it.n += 1;
+                e.items.set(k, it);
+            }
             e.hits += p.hits;
             e.cs += r.cs;
             if (p.reinforcement) e.reinf += 1;
@@ -388,13 +438,24 @@ function opponents(rows) {
             unitHpMedian: median(e.unitHp),
             dpuPerHit: round(dpuPerHit, 0),
             intervalMeasured: round(interval, 2),
+            // Cadence pile par pile plutôt que cumulée : plus fidèle quand une pile tombe tôt.
+            intervalMedian: round(median(e.intervals), 2),
             dpsPerUnit: interval ? round(dpuPerHit / interval, 0) : null,
             reinforcements: e.reinf,
+            // Équipement d'en face : la médiane de chaque affixe, et les pièces les plus portées.
+            gearBonuses: meanBonuses(e.bonuses),
+            topItems: [...e.items.values()].sort((x, y) => y.n - x.n).slice(0, 3),
+            typeLevel: levelSpan(e),
         };
     }).sort((a, b) => b.fights - a.fights);
 
     return {
         pool,
+        gear: {
+            bonuses: meanBonuses(rows.flatMap((r) => r.theirPiles.map((p) => p.gearBonuses || {}))),
+            mineBonuses: meanBonuses(rows.flatMap((r) => r.myPiles.filter((p) => !p.reinforcement)
+                .map((p) => p.gearBonuses || {}))),
+        },
         levelGap: median(rows.map((r) => r.opponent.level - r.myLevel)),
         armyHpMedian: median(rows.map((r) => r.army.theirs.hp)),
         armyQtyMedian: median(rows.map((r) => r.army.theirs.qty)),
@@ -467,6 +528,36 @@ function measureMatchups(reports, meId) {
             hits: xs.length, ratio: round(median(xs), 3),
         };
     }).sort((a, b) => (a.from === b.from ? a.to.localeCompare(b.to) : a.from.localeCompare(b.from)));
+}
+
+/* Amplitude du niveau de type sur un lot de piles : le plus bas, le plus haut, le plus récent, et
+   l'écart de puissance que ça représente (+2 % de vie et de dégâts par palier, additif). Sans ça,
+   un « dégâts par unité » cumulé laisserait croire à une mesure stable alors qu'il mélange des
+   combats menés à des niveaux différents. */
+function levelSpan(e) {
+    if (!e.levels.length) return null;
+    const min = Math.min(...e.levels);
+    const max = Math.max(...e.levels);
+    const last = e.levelAt.get(Math.max(...e.levelAt.keys())) ?? max;
+    return {
+        min,
+        max,
+        last,
+        median: median(e.levels),
+        // Combien le type a gagné en puissance entre son plus bas et son plus haut niveau vu.
+        spreadPct: round(100 * ((1 + 0.02 * (max - 1)) / (1 + 0.02 * (min - 1)) - 1), 1),
+    };
+}
+
+/* Moyenne de chaque affixe sur un lot de piles. La moyenne et non la médiane : la plupart des
+   pièces ne portent aucun affixe sur une stat donnée, une médiane vaudrait 0 partout et cacherait
+   justement ce qui distingue un équipement d'un autre. */
+function meanBonuses(list) {
+    const out = {};
+    for (const stat of ['dmg', 'hp', 'speed', 'crit', 'riposte']) {
+        out[stat] = round(mean(list.map((b) => b?.[stat] || 0)), 2);
+    }
+    return out;
 }
 
 /* ---------- Petits calculs ---------- */

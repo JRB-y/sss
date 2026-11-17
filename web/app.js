@@ -6,7 +6,10 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-const state = { analysis: null, backtest: null, compos: null, docs: {}, busy: null };
+const state = {
+    analysis: null, backtest: null, compos: null, docs: {}, busy: null,
+    enemies: null, enemy: null,
+};
 
 /* ── Démarrage ─────────────────────────────────────────────────────────────── */
 
@@ -29,12 +32,18 @@ function wireNav() {
 
 const VIEWS = {
     tableau: { title: 'Tableau de bord' },
+    analyse: { title: 'Analyse des combats' },
+    adversaires: { title: 'Adversaires' },
+    simulateur: { title: 'Simulateur' },
+    compos: { title: 'Compositions' },
     regles: { title: 'Les règles', doc: 'regles.md' },
     troupes: { title: 'Les troupes', doc: 'troupes.md' },
-    analyse: { title: 'Analyse des combats' },
-    compos: { title: 'Compositions' },
+    objets: { title: 'Les objets', doc: 'objets.md' },
 };
 
+/* Une vue se remplit toute seule à la première visite : plus de bouton « Analyser » à cliquer
+   avant de voir quoi que ce soit. Tout ce qui est affiché ici se calcule hors ligne, à partir de
+   data/ — le seul geste qui demande le jeu est « Mettre à jour ». */
 async function show(name) {
     const view = VIEWS[name] ? name : 'tableau';
     for (const el of $$('.view')) el.hidden = el.id !== `view-${view}`;
@@ -45,7 +54,9 @@ async function show(name) {
     document.title = `SSS — ${VIEWS[view].title}`;
     if (VIEWS[view].doc) await openDoc(view, VIEWS[view].doc);
     if (view === 'analyse' && !state.analysis) await runAnalyse({ silent: true });
-    if (view === 'compos' && !state.compos) renderCompos();
+    if (view === 'adversaires' && !state.enemies) await loadEnemies();
+    if (view === 'simulateur' && !simu.types) await loadSimu();
+    if (view === 'compos' && !state.compos) await runCompos({ silent: true });
     scrollTo({ top: 0, behavior: 'instant' });
 }
 
@@ -59,12 +70,12 @@ function wireActions() {
 
 async function act(action, btn) {
     const jobs = {
+        'update-all': () => post('update-all'),
         'fetch-fights': () => post('fetch-fights'),
         'fetch-fights-refresh': () => post('fetch-fights?refresh=1'),
         'fetch-troops': () => post('fetch-troops'),
         'fetch-rules': () => post('fetch-rules?locale=fr'),
-        analyse: () => runAnalyse(),
-        compos: () => runCompos(),
+        'rebuild-enemies': () => post('rebuild-enemies'),
     };
     if (!jobs[action]) return;
     const others = $$('[data-action]');
@@ -86,20 +97,35 @@ async function post(route) {
     // Les données ont changé : on invalide ce qui en dépend.
     state.analysis = null;
     state.compos = null;
+    state.enemies = null;
+    state.enemy = null;
+    simu.types = null;
+    simu.result = null;
     state.docs = {};
     toast(summarise(route, res.result), 'good');
     return res;
 }
 
 function summarise(route, result) {
-    if (route.startsWith('fetch-fights')) {
-        const n = result?.downloaded;
-        if (!n) return `Rien de neuf : les ${result?.listed ?? '?'} combats de la fenêtre sont déjà en base.`;
-        return `${n} combat(s) téléchargé(s) · ${result.total} en base.`;
+    if (route.startsWith('update-all')) {
+        return [fightsLine(result?.fights), `${result?.troops?.units ?? '?'} unités relevées`].join(' · ');
     }
+    if (route.startsWith('fetch-fights')) return fightsLine(result);
     if (route.startsWith('fetch-troops')) return `${result?.units ?? '?'} unités relevées.`;
     if (route.startsWith('fetch-rules')) return `Règles régénérées (${result?.sections ?? '?'} sections).`;
+    if (route.startsWith('rebuild-enemies')) {
+        return `${result?.enemies ?? '?'} adversaires, ${result?.changes ?? '?'} changements de troupes, ${result?.items ?? '?'} objets.`;
+    }
     return 'Terminé.';
+}
+
+function fightsLine(r) {
+    if (!r) return 'Terminé.';
+    const n = r.downloaded;
+    const head = n
+        ? `${n} nouveau(x) combat(s) · ${r.total} en base`
+        : `Rien de neuf : les ${r.listed ?? '?'} combats de la fenêtre étaient déjà en base`;
+    return r.holes?.length ? `${head} — <strong>trou détecté dans l’historique</strong>` : head;
 }
 
 /* ── État global ───────────────────────────────────────────────────────────── */
@@ -124,21 +150,71 @@ function renderDashSummary() {
     const box = $('#dash-summary');
     if (!s) return;
     const warn = [];
-    if (!s.fights.count) warn.push('Aucun combat en base : commence par <strong>Récupérer les combats</strong>.');
-    if (!s.troops.detailed) warn.push('Aucune fiche de troupe : lance <strong>Relever les troupes</strong>.');
-    if (!s.docs.length) warn.push('Aucun document : lance <strong>Régénérer les règles</strong>.');
+    if (!s.fights.count) warn.push('Aucun combat en base : clique sur <strong>Mettre à jour</strong>.');
+    else if (!s.troops.detailed) warn.push('Aucune fiche de troupe : <strong>Mettre à jour</strong> les relèvera.');
+    if (s.enemies?.stale) {
+        warn.push('Les fiches d’adversaires datent d’avant le dernier téléchargement de combats : '
+            + '<strong>Reconstruire les fiches</strong> (actions détaillées) les remet à jour.');
+    }
 
     box.innerHTML = `
         <h2 class="block">En base</h2>
         <div class="tiles">
             ${tile('Combats archivés', s.fights.count, s.fights.counts
-        ? `${s.fights.counts.sent ?? 0} envoyés · ${s.fights.counts.received ?? 0} reçus`
+        ? `${s.fights.counts.attack ?? s.fights.counts.sent ?? 0} en attaque · ${s.fights.counts.defense ?? s.fights.counts.received ?? 0} en défense`
         : 'le jeu n’expose qu’une fenêtre récente')}
+            ${tile('Adversaires suivis', s.enemies?.count ?? 0, `${s.enemies?.changes ?? 0} changements de troupes relevés`)}
+            ${tile('Objets catalogués', s.items?.count ?? 0, 'armes, protections et porte-bonheur vus en combat')}
             ${tile('Fiches de troupes', `${s.troops.detailed}<small>/ ${s.troops.count}</small>`, 'chiffrées / relevées')}
-            ${tile('Seuil de capacité', s.crew?.abilityNeed ?? '—', '10 % de tes places de troupes')}
-            ${tile('Documents', s.docs.length, s.docs.map((d) => d.name).join(' · ') || '—')}
         </div>
+        ${resumeCard(s)}
         ${warn.length ? `<div class="stack" style="margin-top:1rem">${warn.map((w) => callout(w, 'bad')).join('')}</div>` : ''}`;
+}
+
+/* La reprise incrémentale est la promesse centrale du dépôt : elle doit se vérifier d'un coup
+   d'œil, pas se deviner. On montre d'où le prochain run repartira, ce que la fenêtre du jeu
+   couvrait au dernier passage, et tout trou constaté. */
+function resumeCard(s) {
+    const f = s.fights;
+    const run = f.lastRun;
+    const dirs = Object.entries(f.window || {});
+    const holes = f.holes || [];
+    const span = f.counts?.firstFightAt && f.counts?.lastFightAt
+        ? `du ${when(f.counts.firstFightAt)} au ${when(f.counts.lastFightAt)}`
+        : null;
+
+    return `
+        <h2 class="block">Reprise de l’historique</h2>
+        <div class="cards">
+            <div class="card">
+                <h3>Où en est l’archive</h3>
+                <p>${f.count} combats accumulés${span ? `, ${span}` : ''}.
+                    ${run ? `Dernier passage le <strong>${fmtDate(run.at)}</strong> :
+                        ${run.listed} combats listés, ${run.downloaded} téléchargés${run.failed ? `, ${run.failed} en échec` : ''}.`
+        : 'Aucun passage enregistré par cette version du script : le prochain en posera le repère.'}</p>
+                <p class="note">Le prochain passage ne redemandera au jeu que les combats plus récents
+                    que ${f.watermark && Object.keys(f.watermark).length
+        ? Object.entries(f.watermark).map(([d, id]) => `<code>${esc(d)} &gt; ${id}</code>`).join(', ')
+        : '<code>—</code>'}. Les combats déjà en base y restent même quand le jeu ne les montre plus.</p>
+            </div>
+            <div class="card">
+                <h3>La fenêtre du jeu</h3>
+                ${dirs.length ? dirs.map(([dir, w]) => `<p><strong>${esc(dir)}</strong> — ${w.size} lignes
+                    (ids ${w.oldestId} → ${w.newestId}), dont ${w.alreadyKnown} déjà en base au dernier passage.</p>`).join('')
+        : '<p class="note">Mesurée au prochain passage.</p>'}
+                <p class="note">Le serveur n’expose pas de pagination : il ne montre qu’une fenêtre fixe
+                    des combats récents. Plus tu attends entre deux mises à jour, plus tu risques d’en
+                    perdre définitivement — c’est le seul point où l’archive peut avoir des trous.</p>
+            </div>
+            ${holes.length ? `<div class="card">
+                <h3 class="v-bad">Trous constatés</h3>
+                ${holes.slice(-5).map((h) => `<p><strong>${esc(h.dir)}</strong> — dernier combat connu
+                    ${h.lastKnownId}, la fenêtre ne remontait qu’au ${h.oldestListedId} : les combats entre
+                    les deux ne sont plus exposés par le jeu.</p>`).join('')}
+                <p class="note">Seule parade : mettre à jour plus souvent (la fenêtre fait
+                    ${holes[holes.length - 1].windowSize} lignes par onglet).</p>
+            </div>` : ''}
+        </div>`;
 }
 
 /* ── Analyse ───────────────────────────────────────────────────────────────── */
@@ -152,6 +228,7 @@ async function runAnalyse({ silent = false } = {}) {
     }
     state.analysis = res.analysis;
     state.backtest = res.backtest;
+    state.skills = res.skills || null;
     renderAnalyse();
     if (!silent) location.hash = 'analyse';
 }
@@ -214,11 +291,12 @@ function renderAnalyse() {
 
         <h2 class="block">Rendement de mes types</h2>
         ${dataTable(
-        ['Type', 'Rôle', 'Capacité', 'Combats', 'Qté méd.', 'Part des dégâts', 'Dégâts / unité', 'Subis / unité', 'Échange', 'Cap. active'],
+        ['Type', 'Rôle', 'Capacité', 'Niv. type', 'Combats', 'Qté méd.', 'Part des dégâts', 'Dégâts / unité', 'Subis / unité', 'Échange', 'Cap. active'],
         a.myTypes.map((t) => [
             `<strong>${esc(t.fr)}</strong>`,
             `<span class="chip chip-role">${esc(t.roleFr)}</span>`,
             esc(t.abilityFr || '—'),
+            levelCell(t.typeLevel),
             num(t.fights),
             num(t.qtyMedian),
             barCell(t.damageShare, Math.max(...a.myTypes.map((x) => x.damageShare)), `${t.damageShare} %`),
@@ -228,7 +306,7 @@ function renderAnalyse() {
             t.abilityFireRate >= 99 ? '<span class="chip chip-on">✓ 100 %</span>'
                 : `<span class="chip chip-off">${t.abilityFireRate} %</span>`,
         ]),
-        [0, 0, 0, 1, 1, 0, 1, 1, 1, 0],
+        [0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0],
     )}
         <p class="note"><strong>Échange</strong> = dégâts infligés ÷ dégâts subis par ce type. Au-dessus de 1, il rend
             plus qu’il ne prend. <strong>Dégâts / unité</strong> cumule tout l’historique : un type souvent engagé en
@@ -239,19 +317,26 @@ function renderAnalyse() {
             Écart de niveau médian : ${a.opponents.levelGap >= 0 ? '+' : ''}${a.opponents.levelGap}.
             Fortification médiane en face : ${a.opponents.fortMedian ?? 0} % de dégâts en moins quand tu attaques.</p>
         ${dataTable(
-        ['Type adverse', 'Rôle', 'Capacité', 'Rencontré', 'Qté méd.', 'PV / unité', 'Dégâts / coup', 'Renforts'],
+        ['Type adverse', 'Rôle', 'Capacité', 'Niv. type', 'Rencontré', 'Qté méd.', 'PV / unité', 'Dégâts / coup', 'Cadence', 'Bonus d’objets moyens', 'Pièces les plus portées', 'Renforts'],
         a.opponents.pool.map((o) => [
             `<strong>${esc(o.key)}</strong>`,
             `<span class="chip chip-role">${esc(o.roleFr)}</span>`,
             esc(o.abilityFr || '—'),
+            levelCell(o.typeLevel),
             barCell(o.fights, Math.max(...a.opponents.pool.map((x) => x.fights)), `${o.fights} piles`),
             num(o.qtyMedian),
             num(o.unitHpMedian),
             num(o.dpuPerHit),
+            o.intervalMedian ? `${String(o.intervalMedian).replace('.', ',')} s` : '—',
+            bonusCell(o.gearBonuses),
+            (o.topItems || []).map((i) => esc(i.name)).join(', ') || '—',
             o.reinforcements ? num(o.reinforcements) : '—',
         ]),
-        [0, 0, 0, 0, 1, 1, 1, 1],
+        [0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1],
     )}
+        ${gearCallout(a.opponents.gear)}
+
+        ${talentsCard(state.skills, bt)}
 
         ${bt ? backtestCard(bt) : ''}
 
@@ -281,7 +366,7 @@ function renderAnalyse() {
             `<span style="color:var(--text-3)">${esc(when(f.at))}</span>`,
             esc(f.role),
             f.won ? '<span class="chip chip-on">Victoire</span>' : '<span class="chip chip-off">Défaite</span>',
-            esc(f.opponent.name),
+            `<button type="button" class="link" data-goto-enemy="${f.opponent.id}">${esc(f.opponent.name)}</button>`,
             num(f.opponent.level),
             `<span class="${f.delta >= 0 ? 'v-good' : 'v-bad'}">${f.delta >= 0 ? '+' : ''}${f.delta}</span>`,
             f.myPiles.filter((p) => !p.reinforcement).map((p) => `${esc(p.base)}&nbsp;×${p.qty}`).join(', '),
@@ -291,7 +376,82 @@ function renderAnalyse() {
         [0, 0, 0, 0, 1, 1, 0, 1, 1],
         'wrap-6',
     )}`;
+
+    // Depuis un combat, ouvrir directement la fiche de l'adversaire qu'on y a affronté.
+    for (const b of $$('[data-goto-enemy]', body)) {
+        b.addEventListener('click', async () => {
+            location.hash = 'adversaires';
+            if (!state.enemies) await loadEnemies();
+            await openEnemy(b.dataset.gotoEnemy);
+        });
+    }
 }
+
+/* Les talents sont la troisième source de puissance, à côté du niveau de type et de l'équipement.
+   Sans eux, l'écart entre les stats « de base » et les stats « réelles » d'une carte restait un
+   trou noir où talents et objets se confondaient. */
+function talentsCard(sk, bt) {
+    if (!sk) {
+        return callout(`<strong>Arbre de talents inconnu.</strong> Lance <strong>Mettre à jour</strong> :
+            le simulateur pourra alors séparer ce qui vient de tes talents de ce qui vient de ton
+            équipement, au lieu de tout mettre dans le même sac.`, 'bad');
+    }
+    const b = sk.bonuses;
+    const rows = [
+        ['Dégâts', `+${b.dmgPct} %`, b.dmgFlat ? `et +${b.dmgFlat} par coup, ajoutés avant le pourcentage` : ''],
+        ['Critique', `+${b.critPts} pts`, b.critDmgPct ? `et +${b.critDmgPct} % de dégâts critiques` : ''],
+        ['Vitesse d’attaque', `+${b.speedPct} %`, ''],
+        ['Vie', `+${b.hpPct} %`, b.hpPct ? '' : 'aucun point en Défense'],
+        ['Riposte', `+${b.counterPts || 0} pts`, b.counterPct ? `et +${b.counterPct} % de force` : ''],
+    ];
+    return `
+        <h2 class="block">Tes talents</h2>
+        <div class="cards">
+            <div class="card">
+                <h3>Ce qu’ils apportent en combat</h3>
+                <table class="mini">${rows.map(([k, v, note]) => `<tr><th>${esc(k)}</th>
+                    <td class="num">${esc(v)}</td><td style="color:var(--text-3)">${esc(note)}</td></tr>`).join('')}</table>
+                <p class="note">${sk.spent} point(s) dépensés${sk.toSpend ? `, <strong class="v-bad">${sk.toSpend} non dépensé(s)</strong>` : ''}
+                    — ${Object.entries(sk.spentPerBranch || {}).map(([k, v]) => `${esc(k)} ${v}`).join(' · ')}.</p>
+            </div>
+            <div class="card">
+                <h3>Pourquoi ça compte ici</h3>
+                <p>Une stat réelle vaut <code>(base du type à son niveau + bonus plats) × (1 + talents % + objets %)</code>.
+                    Vérifié : les types que tu n’équipes pas ont des PV réels <em>exactement</em> égaux à leurs PV de base,
+                    parce que ta branche Défense est à ${sk.spentPerBranch?.def ?? 0} point.</p>
+                <p>Conséquence directe : <strong>tout l’écart de PV d’un type équipé vient de son matériel</strong>,
+                    bonus intrinsèque compris — celui que le jeu n’écrit nulle part.</p>
+                ${bt ? `<p class="note">Le simulateur applique ces bonus et un multiplicateur de critique de
+                    <strong>×${bt.critMult}</strong>, retenu parce que c’est celui qui rejoue le mieux ton historique.</p>` : ''}
+            </div>
+            <div class="card">
+                <h3>Talents achetés</h3>
+                ${(sk.nodes || []).map((n) => `<p><strong>${esc(n.name)}</strong> ${n.points}/${n.max ?? '∞'}
+                    <span style="color:var(--text-3)">— ${esc(n.effects.map((e) => e.raw).join(', '))}</span></p>`).join('') || '<p>Aucun.</p>'}
+            </div>
+        </div>`;
+}
+
+/* Mon équipement contre le leur, affixe par affixe. Ce sont des moyennes par pile engagée : la
+   plupart des pièces ne portent pas d'affixe sur une stat donnée, donc une médiane vaudrait 0
+   partout et masquerait justement l'écart. */
+function gearCallout(gear) {
+    if (!gear) return '';
+    const rows = Object.keys(AFFIX_FR).filter((k) => (gear.bonuses?.[k] || gear.mineBonuses?.[k]));
+    if (!rows.length) return '';
+    const behind = rows.filter((k) => (gear.bonuses[k] || 0) > (gear.mineBonuses[k] || 0) + 0.2);
+    return callout(`<strong>Équipement : toi contre eux.</strong> Par pile engagée, en moyenne —
+        ${rows.map((k) => `${AFFIX_FR[k]} <strong>${fmtAffix(gear.mineBonuses[k], k)}</strong> contre
+        <strong>${fmtAffix(gear.bonuses[k], k)}</strong>`).join(' · ')}.
+        ${behind.length
+        ? `Tu es derrière sur ${behind.map((k) => AFFIX_FR[k]).join(', ')}.`
+        : 'Tu es au niveau ou devant sur toutes les stats.'}
+        Ces chiffres ne comptent que les affixes que le jeu publie ; le bonus propre à chaque objet,
+        lui, n’est écrit nulle part (voir <a href="#objets">Les objets</a>).`,
+    behind.length ? 'bad' : 'good');
+}
+
+const fmtAffix = (v, k) => `${(v || 0) > 0 ? '+' : ''}${String(v || 0).replace('.', ',')}${AFFIX_UNIT[k] || ''}`;
 
 function readiness(a) {
     const xs = a.fights.filter((f) => f.role === 'défense')
@@ -359,9 +519,561 @@ function marginStrip(bt) {
     </div>`;
 }
 
+/* ── Adversaires ───────────────────────────────────────────────────────────── */
+
+async function loadEnemies() {
+    const res = await api('/api/enemies');
+    if (res.empty) {
+        $('#adversaires-body').innerHTML = callout(res.reason, 'bad');
+        return;
+    }
+    state.enemies = res;
+    renderEnemies();
+}
+
+function renderEnemies() {
+    const res = state.enemies;
+    const box = $('#adversaires-body');
+    const changed = res.players.filter((p) => p.changes > 0);
+
+    box.innerHTML = `
+        <div class="tiles">
+            ${tile('Adversaires croisés', res.counts.enemies, `${res.counts.observations} relevés d’armée`)}
+            ${tile('Ont changé de troupes', changed.length, `${res.counts.changes} changements datés`)}
+            ${tile('Relevé le', fmtDate(res.updatedAt), 'reconstruit depuis les combats en base')}
+        </div>
+        ${callout(`Tout vient des rapports de combat : un rapport donne l’armée <em>complète</em> des deux
+            camps — type, quantité, PV unitaires, niveau de type, capacité et les trois pièces
+            d’équipement de chaque pile. Rien n’est deviné, et aucune requête supplémentaire n’est faite
+            au jeu. Clique sur une ligne pour voir l’armée actuelle et l’historique de ses changements.`)}
+
+        <h2 class="block">Les ${res.players.length} adversaires</h2>
+        ${dataTable(
+        ['Adversaire', 'Niv.', 'Classement', 'Combats', 'Mon bilan', 'Fortif.', 'Armée connue', 'Types engagés', 'Changements', 'Vu pour la dernière fois'],
+        res.players.map((p) => [
+            `<button type="button" class="link" data-enemy="${p.id}">${esc(p.name)}</button>`,
+            p.level.last === p.level.first ? num(p.level.last) : `${num(p.level.first)} → ${num(p.level.last)}`,
+            p.rating.last != null ? num(p.rating.last) : '—',
+            num(p.record.fights),
+            `<span class="${p.record.myWins >= p.record.myLosses ? 'v-good' : 'v-bad'}">${p.record.myWins}V / ${p.record.myLosses}D</span>`,
+            p.fort.last != null ? `${p.fort.last} %` : '—',
+            p.latest ? `${num(p.latest.army.qty)} unités · ${num(p.latest.army.maxHp)} PV` : '—',
+            p.latest ? p.latest.piles.map((x) => `${esc(x.fr)}&nbsp;×${num(x.qty)}`).join(', ') : '—',
+            p.changes ? `<span class="chip chip-off">${p.changes}</span>` : '—',
+            `<span style="color:var(--text-3)">${esc(when(p.span.to))}</span>`,
+        ]),
+        [0, 1, 1, 1, 0, 1, 0, 0, 1, 0],
+        'wrap-7',
+    )}
+
+        <div id="enemy-detail"></div>`;
+
+    for (const b of $$('[data-enemy]', box)) {
+        b.addEventListener('click', () => openEnemy(b.dataset.enemy));
+    }
+}
+
+async function openEnemy(id) {
+    const host = $('#enemy-detail');
+    host.innerHTML = '<p class="empty">Chargement…</p>';
+    let res;
+    try {
+        res = await api(`/api/enemy?id=${encodeURIComponent(id)}`);
+    } catch (e) {
+        host.innerHTML = callout(e.message, 'bad');
+        return;
+    }
+    state.enemy = res.player;
+    renderEnemy(host, res.player);
+    host.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function renderEnemy(host, p) {
+    const latest = p.latest;
+    const changes = p.changes.slice().reverse(); // du plus récent au plus ancien
+
+    host.innerHTML = `
+        <h2 class="block">${esc(p.name)}${p.aka.length > 1 ? ` <small>alias ${p.aka.map(esc).join(', ')}</small>` : ''}</h2>
+        <div class="tiles">
+            ${tile('Niveau', p.level.last, p.level.history.length > 1
+        ? `${p.level.first} → ${p.level.last} sur la période`
+        : 'inchangé depuis qu’on le croise')}
+            ${tile('Classement', p.rating.last ?? '—', p.rating.min != null ? `entre ${p.rating.min} et ${p.rating.max}` : '')}
+            ${tile('Mon bilan contre lui', `${p.record.myWins}<small>/${p.record.fights}</small>`,
+        `${p.record.asAttacker} fois attaquant · ${p.record.asDefender} fois défenseur`,
+        { tone: p.record.myWins * 2 >= p.record.fights ? 'good' : 'bad' })}
+            ${tile('Fortifications', p.fort.last != null ? `${p.fort.last}<small>%</small>` : '—',
+        p.fort.max ? `maximum vu : ${p.fort.max} %` : 'jamais vu en défense')}
+        </div>
+
+        ${latest ? `
+            <h3 class="block">Son armée au dernier combat <small>(${esc(when(latest.at))}, combat ${latest.fightId})</small></h3>
+            <p class="note">${num(latest.army.qty)} unités, ${num(latest.army.maxHp)} PV au total, ${latest.army.types} types.
+                ${latest.reinforcements.length ? `${latest.reinforcements.length} renfort(s) de famille en plus — ils ne font pas partie de sa compo.` : ''}
+                ${latest.abOn.length ? `Capacités qui ont fonctionné : ${latest.abOn.map((k) => `<code>${esc(k)}</code>`).join(', ')}.` : 'Aucune capacité n’a fonctionné.'}</p>
+            ${dataTable(
+        ['Type', 'Rôle', 'Capacité', 'Quantité', 'PV / unité', 'Niv. type', 'Cadence mesurée', 'Arme', 'Protection', 'Porte-bonheur', 'Bonus d’objets'],
+        latest.piles.map((x) => [
+            `<strong>${esc(x.fr)}</strong>`,
+            `<span class="chip chip-role">${esc(x.roleFr || '?')}</span>`,
+            esc(x.abilityFr || '—'),
+            num(x.qty),
+            num(x.unitHp),
+            num(x.typeLevel),
+            x.measured?.intervalS ? `${String(x.measured.intervalS).replace('.', ',')} s` : '—',
+            ...['weapon', 'armor', 'charm'].map((slot) => gearCell(x.gear.find((g) => g.slot === slot))),
+            bonusCell(x.gearBonuses),
+        ]),
+        [0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0],
+    )}
+            <p class="note">La <strong>cadence mesurée</strong> vient de la frise des coups du combat, pas
+                d’une fiche : c’est le délai réel entre deux frappes de cette pile. Les <strong>bonus
+                d’objets</strong> ne comptent que les affixes que le jeu chiffre ; chaque pièce apporte en
+                plus un bonus intrinsèque que le jeu ne publie pas (voir <a href="#objets">Les objets</a>).</p>
+        ` : ''}
+
+        <h3 class="block">Historique de ses troupes</h3>
+        ${changes.length ? `<ol class="timeline">
+            ${changes.map((c) => `<li>
+                <div class="tl-when">${esc(when(c.at))}<small>combat ${c.fightId}</small></div>
+                <div class="tl-body">
+                    <p class="tl-kinds">${c.kinds.map((k) => `<span class="chip chip-off">${esc(k)}</span>`).join('')}</p>
+                    <ul>${c.lines.map((l) => `<li>${esc(l)}</li>`).join('')}</ul>
+                </div>
+            </li>`).join('')}
+        </ol>` : `<p class="note">Aucun changement relevé : son armée est restée identique sur les
+            ${p.record.fights} combat(s) où on l’a croisé.</p>`}
+
+        ${p.level.history.length > 1 || p.rating.history.length > 1 ? `
+            <h3 class="block">Sa progression</h3>
+            ${dataTable(['Quand', 'Niveau', 'Classement'],
+        mergeHistory(p.level.history, p.rating.history).map((r) => [
+            `<span style="color:var(--text-3)">${esc(when(r.at))}</span>`,
+            r.level != null ? num(r.level) : '—',
+            r.rating != null ? num(r.rating) : '—',
+        ]), [0, 1, 1])}` : ''}`;
+}
+
+/* Niveau de type : le dernier connu, et l'amplitude si le type a progressé pendant l'historique.
+   Chaque palier vaut +2 % de vie et de dégâts pour toutes les unités du type — additif, pas composé. */
+function levelCell(lv) {
+    if (!lv) return '—';
+    if (lv.min === lv.max) return `<span class="lv">${lv.last}</span>`;
+    return `<span class="lv">${lv.last}</span><small style="color:var(--text-3)"> (${lv.min}→${lv.max}, ${lv.spreadPct} %)</small>`;
+}
+
+function gearCell(g) {
+    if (!g) return '—';
+    const bonus = Object.entries(g.affixes || {})
+        .map(([k, v]) => `${v > 0 ? '+' : ''}${String(v).replace('.', ',')}${AFFIX_UNIT[k] || ''} ${AFFIX_FR[k] || k}`);
+    return `<span class="item r-${g.rarity ?? 0}" title="${esc(g.rarityFr || '')}">
+        <b>${esc(g.name)}</b>${bonus.length ? `<small>${esc(bonus.join(' · '))}</small>` : ''}</span>`;
+}
+
+function bonusCell(b) {
+    const parts = Object.entries(b || {}).filter(([, v]) => v)
+        .map(([k, v]) => `${v > 0 ? '+' : ''}${String(v).replace('.', ',')}${AFFIX_UNIT[k] || ''} ${AFFIX_FR[k] || k}`);
+    return parts.length ? esc(parts.join(' · ')) : '<span style="color:var(--text-3)">aucun</span>';
+}
+
+const AFFIX_FR = { dmg: 'dégâts', hp: 'vie', speed: 'vitesse', crit: 'crit.', riposte: 'riposte' };
+const AFFIX_UNIT = { dmg: ' %', hp: ' %', speed: ' %', crit: ' pts', riposte: ' pts' };
+
+/** Deux séries datées fondues en un seul tableau chronologique. */
+function mergeHistory(levels, ratings) {
+    const by = new Map();
+    for (const x of levels) by.set(x.at, { at: x.at, level: x.value, rating: null });
+    for (const x of ratings) {
+        const row = by.get(x.at) || { at: x.at, level: null, rating: null };
+        row.rating = x.value;
+        by.set(x.at, row);
+    }
+    return [...by.values()].sort((a, b) => b.at - a.at);
+}
+
+/* ── Simulateur ────────────────────────────────────────────────────────────── */
+
+/* Deux usages dans un seul écran : rejouer un combat archivé en changeant de composition, ou
+   éprouver une composition montée de toutes pièces. Dans les deux cas l'adversaire est réel —
+   son armée, son équipement et ses murs viennent du rapport de combat, pas d'une cible théorique. */
+
+const simu = { types: null, scenarios: null, fightId: null, piles: new Map(), source: 'current', result: null, running: false };
+
+async function loadSimu() {
+    const box = $('#simu-body');
+    try {
+        const [types, scenarios] = await Promise.all([api('/api/types'), api('/api/scenarios')]);
+        if (types.empty || scenarios.empty) {
+            box.innerHTML = callout(types.reason || scenarios.reason, 'bad');
+            return;
+        }
+        simu.types = types;
+        simu.scenarios = scenarios.scenarios;
+        simu.fightId = simu.scenarios[0]?.fightId ?? null;
+        useSource('current');
+    } catch (e) {
+        box.innerHTML = callout(e.message, 'bad');
+        return;
+    }
+    renderSimu();
+}
+
+/** Remplit la composition depuis une origine : l'actuelle, celle du combat visé, ou rien. */
+function useSource(source) {
+    simu.source = source;
+    simu.piles = new Map();
+    if (source === 'current') {
+        for (const p of simu.types.current) simu.piles.set(p.key, p.qty);
+    } else if (source === 'fight') {
+        const sc = currentScenario();
+        for (const p of sc?.mine || []) simu.piles.set(p.key, p.qty);
+    }
+}
+
+const currentScenario = () => simu.scenarios.find((s) => s.fightId === simu.fightId) || null;
+const simuUsed = () => [...simu.piles.values()].reduce((a, n) => a + n, 0);
+const simuTypes = () => [...simu.piles.values()].filter((n) => n > 0).length;
+
+function renderSimu({ keepResult = true } = {}) {
+    const box = $('#simu-body');
+    const t = simu.types;
+    const sc = currentScenario();
+    const used = simuUsed();
+    const over = used > t.slots;
+
+    box.innerHTML = `
+        <div class="simu">
+            <section class="simu-setup">
+                <h2 class="block">1 · Contre qui</h2>
+                <div class="field">
+                    <label for="simu-foe">Combat archivé</label>
+                    <select id="simu-foe">
+                        ${simu.scenarios.map((s) => `<option value="${s.fightId}" ${s.fightId === simu.fightId ? 'selected' : ''}>
+                            ${esc(s.opponent.name)} — ${esc(s.role)} · ${esc(when(s.at))} · ${num(s.army.qty)} unités${s.won ? ' · gagné' : ''}
+                        </option>`).join('')}
+                    </select>
+                </div>
+                ${sc ? foeCard(sc) : ''}
+
+                <h2 class="block">2 · Avec quoi</h2>
+                <div class="seg-row">
+                    ${[['current', 'Ma compo actuelle'], ['fight', 'Celle de ce combat'], ['blank', 'Partir de zéro']]
+        .map(([k, label]) => `<button type="button" class="seg-btn${simu.source === k ? ' is-on' : ''}" data-source="${k}">${label}</button>`).join('')}
+                </div>
+                <div class="simu-bar ${over ? 'is-over' : ''}">
+                    <span><strong>${num(used)}</strong> / ${num(t.slots)} places</span>
+                    <span class="meter"><i style="width:${Math.min(100, (100 * used) / t.slots)}%"></i></span>
+                    <span class="${simuTypes() > t.typeSlots ? 'v-bad' : ''}">${simuTypes()} / ${t.typeSlots} types</span>
+                </div>
+                ${over ? callout(`Tu dépasses de <strong>${num(used - t.slots)}</strong> places : cette composition
+                    n’est pas alignable en jeu. Le combat se jouera quand même, mais le résultat ne veut rien dire.`, 'bad') : ''}
+                <p class="note">Une capacité ne s’allume qu’à partir de <strong>${num(t.need)}</strong> unités
+                    (10 % de tes places). En dessous, le type la porte sans qu’elle agisse.</p>
+                <div class="simu-types">${t.types.map(typeRow).join('')}</div>
+
+                <h2 class="block">3 · Dans quelles conditions</h2>
+                <div class="controls">
+                    <div class="field">
+                        <label for="simu-role">Rôle</label>
+                        <select id="simu-role">
+                            <option value="">celui du combat (${esc(sc?.role || '?')})</option>
+                            <option value="attaque">j’attaque</option>
+                            <option value="défense">je défends</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="simu-ready">Forme de mes troupes <output id="simu-ready-out"></output></label>
+                        <input id="simu-ready" type="range" min="30" max="100" step="5"
+                            value="${Math.round((sc?.readiness ?? 1) * 100)}">
+                    </div>
+                    <button class="btn" data-simu-run>Lancer le combat</button>
+                </div>
+                <p class="note">En défense, tes piles démarrent rarement à 100 % : elles récupèrent encore
+                    du combat précédent. Le curseur part de la forme réellement mesurée sur ce combat-là.</p>
+            </section>
+
+            <section class="simu-result" id="simu-result">
+                ${keepResult && simu.result ? renderSimuResult(simu.result) : '<p class="empty">Lance le combat pour voir le déroulé.</p>'}
+            </section>
+        </div>`;
+
+    wireSimu();
+}
+
+function foeCard(sc) {
+    return `<div class="foe-card">
+        <div class="foe-head">
+            <strong>${esc(sc.opponent.name)}</strong>
+            <span class="chip chip-role">niveau ${num(sc.opponent.level)}</span>
+            ${sc.fort ? `<span class="chip">${sc.fort} % de fortifications</span>` : ''}
+            <span class="${sc.won ? 'v-good' : 'v-bad'}">${sc.won ? 'gagné' : 'perdu'} ce jour-là</span>
+        </div>
+        <p>${num(sc.army.qty)} unités · ${num(sc.army.hp)} PV ·
+            ${sc.army.piles.filter((p) => !p.reinforcement).map((p) => `${esc(p.fr)}&nbsp;×${num(p.qty)}`).join(', ')}
+            ${sc.army.piles.some((p) => p.reinforcement) ? `<span style="color:var(--text-3)"> + ${sc.army.piles.filter((p) => p.reinforcement).length} renfort(s) de famille</span>` : ''}</p>
+    </div>`;
+}
+
+function typeRow(t) {
+    const qty = simu.piles.get(t.key) || 0;
+    const on = qty >= simu.types.need;
+    const max = simu.types.slots;
+    return `<div class="type-row${qty ? ' is-in' : ''}">
+        <div class="type-id">
+            <strong>${esc(t.fr)}</strong>
+            <small>${esc(t.roleFr || '')} · ${esc(t.abilityFr || 'sans capacité')} · niv. ${t.typeLevel}</small>
+        </div>
+        <div class="type-stats">
+            <span title="PV par unité">${num(t.unitHp)} PV</span>
+            <span title="dégâts moyens par unité et par coup">${num(t.dmgAvg)} dgt</span>
+            <span title="délai entre deux coups">${String(t.speed).replace('.', ',')} s</span>
+            <span title="unités possédées aujourd’hui" style="color:var(--text-3)">${num(t.owned)} en stock</span>
+        </div>
+        <input class="type-range" type="range" min="0" max="${max}" step="1" value="${qty}" data-qty="${t.key}" aria-label="Quantité de ${esc(t.fr)}">
+        <input class="type-num" type="number" min="0" max="${max}" value="${qty}" data-qty-num="${t.key}" aria-label="Quantité de ${esc(t.fr)}">
+        <span class="type-ab ${qty ? (on ? 'is-on' : 'is-off') : ''}">${qty ? (on ? '✓ capacité' : `−${num(simu.types.need - qty)}`) : ''}</span>
+    </div>`;
+}
+
+function wireSimu() {
+    const box = $('#simu-body');
+    const ready = $('#simu-ready');
+    const out = $('#simu-ready-out');
+    const sync = () => { out.textContent = `${ready.value} %`; };
+    sync();
+    ready.addEventListener('input', sync);
+
+    $('#simu-foe').addEventListener('change', (e) => {
+        simu.fightId = Number(e.target.value);
+        if (simu.source === 'fight') useSource('fight');
+        renderSimu({ keepResult: false });
+    });
+
+    for (const b of $$('[data-source]', box)) {
+        b.addEventListener('click', () => { useSource(b.dataset.source); renderSimu({ keepResult: false }); });
+    }
+
+    /* Curseur et champ numérique pilotent la même valeur : on met à jour sans re-rendre toute la
+       page, sinon le curseur perdrait le focus à chaque pixel. */
+    const setQty = (key, value, from) => {
+        const v = Math.max(0, Math.min(simu.types.slots, Math.round(Number(value) || 0)));
+        simu.piles.set(key, v);
+        const range = $(`[data-qty="${key}"]`, box);
+        const number = $(`[data-qty-num="${key}"]`, box);
+        if (from !== 'range') range.value = v;
+        if (from !== 'num') number.value = v;
+        range.closest('.type-row').classList.toggle('is-in', v > 0);
+        const badge = range.closest('.type-row').querySelector('.type-ab');
+        const on = v >= simu.types.need;
+        badge.className = `type-ab ${v ? (on ? 'is-on' : 'is-off') : ''}`;
+        badge.textContent = v ? (on ? '✓ capacité' : `−${num(simu.types.need - v)}`) : '';
+        updateSimuBar();
+    };
+    for (const el of $$('[data-qty]', box)) el.addEventListener('input', () => setQty(el.dataset.qty, el.value, 'range'));
+    for (const el of $$('[data-qty-num]', box)) el.addEventListener('input', () => setQty(el.dataset.qtyNum, el.value, 'num'));
+
+    $('[data-simu-run]').addEventListener('click', runSimu);
+}
+
+function updateSimuBar() {
+    const bar = $('.simu-bar');
+    if (!bar) return;
+    const used = simuUsed();
+    const t = simu.types;
+    bar.classList.toggle('is-over', used > t.slots);
+    bar.children[0].innerHTML = `<strong>${num(used)}</strong> / ${num(t.slots)} places`;
+    bar.children[1].querySelector('i').style.width = `${Math.min(100, (100 * used) / t.slots)}%`;
+    bar.children[2].textContent = `${simuTypes()} / ${t.typeSlots} types`;
+    bar.children[2].className = simuTypes() > t.typeSlots ? 'v-bad' : '';
+}
+
+async function runSimu() {
+    if (simu.running) return;
+    simu.running = true;
+    const btn = $('[data-simu-run]');
+    btn.disabled = true;
+    btn.textContent = 'Combat en cours…';
+    const host = $('#simu-result');
+    try {
+        const body = {
+            opponent: { fightId: simu.fightId },
+            mine: simu.source === 'fight' && !touched()
+                ? { mode: 'historic' }
+                : { mode: 'custom', piles: [...simu.piles].map(([key, qty]) => ({ key, qty })).filter((p) => p.qty > 0) },
+            role: $('#simu-role').value || undefined,
+            readiness: Number($('#simu-ready').value) / 100,
+            slots: simu.types.slots,
+        };
+        const res = await api('/api/simulate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        simu.result = res;
+        host.innerHTML = renderSimuResult(res);
+    } catch (e) {
+        host.innerHTML = callout(e.message, 'bad');
+    } finally {
+        simu.running = false;
+        btn.disabled = false;
+        btn.textContent = 'Lancer le combat';
+    }
+}
+
+/* « Celle de ce combat » non modifiée = rejeu fidèle : on passe par le mode `historic`, qui
+   reconstruit les piles avec leurs PV réels d'alors plutôt qu'avec les stats d'aujourd'hui. */
+function touched() {
+    const sc = currentScenario();
+    if (!sc) return true;
+    const was = new Map(sc.mine.map((p) => [p.key, p.qty]));
+    if (was.size !== [...simu.piles].filter(([, q]) => q > 0).length) return true;
+    for (const [k, q] of simu.piles) {
+        if (q > 0 && was.get(k) !== q) return true;
+    }
+    return false;
+}
+
+/* ── Le combat, tel qu'il se déroule ───────────────────────────────────────── */
+
+function renderSimuResult(res) {
+    const r = res.result;
+    const won = r.iWon;
+    const real = res.real;
+    // Le rejeu d'un vrai combat a une vérité à côté de laquelle se mesurer : on la montre.
+    const replay = res.setup.source.startsWith('ta composition de ce jour-là');
+
+    return `
+        <div class="verdict ${won ? 'is-win' : 'is-loss'}">
+            <div class="verdict-main">
+                <span class="verdict-label">${won ? 'Victoire' : 'Défaite'}</span>
+                <span class="verdict-sub">contre ${esc(res.setup.opponent.name)} · ${esc(res.setup.role)}</span>
+            </div>
+            <dl class="verdict-stats">
+                <div><dt>Marge</dt><dd>${r.margin > 0 ? '+' : ''}${String(r.margin).replace('.', ',')}</dd></div>
+                <div><dt>Durée</dt><dd>${String(r.seconds).replace('.', ',')} s</dd></div>
+                <div><dt>Mes PV restants</dt><dd>${pct(r.left.A)}</dd></div>
+                <div><dt>Les siens</dt><dd>${pct(r.left.B)}</dd></div>
+            </dl>
+        </div>
+
+        ${replay
+        ? callout(`<strong>Rejeu fidèle.</strong> Avec ta composition de ce jour-là, le simulateur dit
+            <strong>${won ? 'victoire' : 'défaite'}</strong> ; la réalité a été
+            <strong>${real.won ? 'une victoire' : 'une défaite'}</strong> en ${String(real.seconds).replace('.', ',')} s.
+            ${won === real.won ? 'Il retrouve le bon vainqueur.' : 'Il se trompe ici — c’est le cas sur environ un combat sur dix.'}`,
+            won === real.won ? 'good' : 'bad')
+        : callout(`<strong>Ce jour-là tu as ${real.won ? 'gagné' : 'perdu'}</strong> avec
+            ${real.myPiles.map((p) => `${esc(p.fr)}&nbsp;×${num(p.qty)}`).join(', ')}
+            (${String(real.seconds).replace('.', ',')} s, ${real.delta >= 0 ? '+' : ''}${real.delta} points).
+            Ci-dessus, le même adversaire affronté par la composition que tu viens de monter.`)}
+
+        <h3 class="block">Le déroulé</h3>
+        ${hpChart(r.trace, res)}
+
+        <h3 class="block">Pile par pile</h3>
+        ${simuPilesTable(res)}
+
+        ${r.trace.abilities.length ? `
+            <h3 class="block">Capacités déclenchées</h3>
+            <ol class="ab-list">
+                ${r.trace.abilities.map(([t, side, key, amount]) => `<li class="${side === 0 ? 'is-mine' : 'is-theirs'}">
+                    <span class="ab-t">${(t / 100).toFixed(2).replace('.', ',')} s</span>
+                    <span class="ab-who">${side === 0 ? 'moi' : esc(res.setup.opponent.name)}</span>
+                    <span class="ab-key">${esc(ABILITY_FR_UI[key] || key)}</span>
+                    ${amount ? `<span class="ab-amount">${num(amount)}</span>` : ''}
+                </li>`).join('')}
+            </ol>` : ''}
+
+        ${res.record ? `
+            <h3 class="block">Et contre tous les autres ?</h3>
+            ${callout(`Un duel ne prouve rien tout seul. La même composition, jouée contre
+                <strong>les ${res.record.fights} combats</strong> de ton historique, en gagne
+                <strong>${res.record.wins}</strong> (${res.record.winRate} %) —
+                ${res.record.attack.wins}/${res.record.attack.fights} en attaque,
+                ${res.record.defense.wins}/${res.record.defense.fights} en défense.
+                <span style="color:var(--text-3)">Les combats défensifs sont rejoués avec la forme
+                réglée ci-contre (${pct(res.setup.readiness)}) : baisse-la pour voir ce que donne une
+                armée qui n’a pas fini de récupérer.</span>`,
+            res.record.winRate >= 50 ? 'good' : null)}` : ''}
+
+        <p class="note">Le simulateur est déterministe : il calcule des espérances, pas un tirage. Deux
+            compositions se comparent donc sans bruit, mais un vrai combat garde sa part de hasard. Sur ton
+            historique, il retrouve le bon vainqueur dans ~90 % des cas. À utiliser pour
+            <strong>classer</strong>, pas pour promettre.</p>`;
+}
+
+/* Courbe des PV des deux camps, avec les capacités en repères. Deux lignes, pas d'aire empilée :
+   on compare deux trajectoires, on ne décompose pas un total. */
+function hpChart(trace, res) {
+    const pts = trace.hp;
+    if (pts.length < 2) return '<p class="note">Combat trop court pour tracer une courbe.</p>';
+    const W = 100;
+    const H = 42;
+    const maxT = pts[pts.length - 1][0] || 1;
+    const x = (t) => (t / maxT) * W;
+    const y = (v) => H - v * H;
+    const line = (idx) => pts.map((p, i) => `${i ? 'L' : 'M'}${x(p[0]).toFixed(2)} ${y(p[idx]).toFixed(2)}`).join(' ');
+
+    const marks = trace.abilities.map(([t, side, key]) => `
+        <line x1="${x(t).toFixed(2)}" y1="0" x2="${x(t).toFixed(2)}" y2="${H}"
+            stroke="${side === 0 ? 'var(--d-teal)' : 'var(--d-rose)'}" stroke-width=".25" stroke-dasharray="1.5 1.5" opacity=".55"/>`).join('');
+
+    const seconds = Math.ceil(maxT / 100);
+    const ticks = Array.from({ length: seconds + 1 }, (_, i) => i)
+        .filter((i) => seconds <= 12 || i % Math.ceil(seconds / 10) === 0);
+
+    return `
+        <figure class="chart">
+            <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+                aria-label="Part de PV restants au fil du combat, moi contre ${esc(res.setup.opponent.name)}">
+                ${[0.25, 0.5, 0.75].map((g) => `<line x1="0" y1="${y(g)}" x2="${W}" y2="${y(g)}" stroke="var(--line-soft)" stroke-width=".2"/>`).join('')}
+                ${marks}
+                <path d="${line(2)}" fill="none" stroke="var(--d-rose)" stroke-width=".9" vector-effect="non-scaling-stroke"/>
+                <path d="${line(1)}" fill="none" stroke="var(--d-teal)" stroke-width="1.1" vector-effect="non-scaling-stroke"/>
+            </svg>
+            <div class="chart-x">${ticks.map((i) => `<span>${i} s</span>`).join('')}</div>
+            <figcaption>
+                <span class="key"><i style="background:var(--d-teal)"></i> mes PV</span>
+                <span class="key"><i style="background:var(--d-rose)"></i> les siens</span>
+                <span class="key"><i class="dash"></i> capacité déclenchée</span>
+                <span style="color:var(--text-3)">part des PV maximum de chaque camp</span>
+            </figcaption>
+        </figure>`;
+}
+
+function simuPilesTable(res) {
+    const rows = [
+        ...res.result.piles.A.map((p) => ({ ...p, side: 'moi' })),
+        ...res.result.piles.B.map((p) => ({ ...p, side: res.setup.opponent.name })),
+    ];
+    return dataTable(
+        ['Camp', 'Type', 'Quantité', 'Capacité', 'Dégâts infligés', 'Dégâts subis', 'PV restants'],
+        rows.map((p) => [
+            p.side === 'moi' ? '<span class="chip chip-on">moi</span>' : `<span class="chip chip-off">${esc(p.side)}</span>`,
+            `<strong>${esc(p.fr)}</strong>`,
+            num(p.qty),
+            p.ability
+                ? (p.abilityOn ? `<span class="chip chip-on">${esc(p.abilityFr || p.ability)}</span>`
+                    : `<span class="chip chip-off">${esc(p.abilityFr || p.ability)} éteinte</span>`)
+                : '—',
+            num(p.dealt),
+            num(p.taken),
+            `<span class="${p.left > 0.3 ? 'v-good' : 'v-bad'}">${pct(p.left)}</span>`,
+        ]),
+        [0, 0, 1, 0, 1, 1, 1],
+    );
+}
+
+const ABILITY_FR_UI = {
+    ambush: 'Embuscade', freeze: 'Gel du temps', frenzy: 'Frénésie', shield: 'Bouclier',
+    shockwave: 'Onde de choc', execute: 'Coup de grâce', rage: 'Rage', fortress: 'Forteresse',
+    second_wind: 'Second souffle', last_stand: 'Dernier carré', intimidate: 'Intimidation',
+    bleed: 'Saignée', reflect: 'Renvoi', corrupt: 'Corruption',
+};
+
 /* ── Compositions ──────────────────────────────────────────────────────────── */
 
-async function runCompos() {
+async function runCompos({ silent = false } = {}) {
     const s = state.server;
     const slots = $('#f-slots')?.value || s?.crew?.slots || '';
     const types = $('#f-types')?.value || s?.crew?.typeSlots || '';
@@ -370,15 +1082,23 @@ async function runCompos() {
     if (slots) q.set('slots', slots);
     if (types) q.set('types', types);
     if (ready) q.set('readiness', String(Number(ready) / 100));
-    const res = await api(`/api/compos?${q}`);
+    // La recherche passe des milliers de compositions contre tout l'historique : quelques secondes.
+    $('#compos-body').innerHTML = '<p class="empty">Recherche en cours — chaque composition est jouée contre tous tes combats archivés…</p>';
+    let res;
+    try {
+        res = await api(`/api/compos?${q}`);
+    } catch (e) {
+        $('#compos-body').innerHTML = callout(e.message, 'bad');
+        return;
+    }
     if (res.empty) {
         $('#compos-body').innerHTML = callout(res.reason, 'bad');
-        location.hash = 'compos';
+        if (!silent) location.hash = 'compos';
         return;
     }
     state.compos = res;
     renderCompos();
-    location.hash = 'compos';
+    if (!silent) location.hash = 'compos';
 }
 
 function renderCompos() {
@@ -434,6 +1154,23 @@ function renderCompos() {
             </div>
         </div>`;
     wireControls();
+    wireTryButtons(box);
+}
+
+/* Depuis une composition proposée, aller la jouer en duel : c'est le chaînon qui manquait entre
+   « voilà ce qui gagnerait le plus souvent » et « montre-moi ce que ça donne contre lui ». */
+function wireTryButtons(box) {
+    for (const b of $$('[data-try]', box)) {
+        b.addEventListener('click', async () => {
+            const piles = JSON.parse(b.dataset.try);
+            if (!simu.types) await loadSimu();
+            simu.source = 'blank';
+            simu.piles = new Map(piles.map((p) => [p.key, p.qty]));
+            simu.result = null;
+            location.hash = 'simulateur';
+            renderSimu({ keepResult: false });
+        });
+    }
 }
 
 function controls(c, ready) {
@@ -489,6 +1226,7 @@ function compoRow(b, rank, current = false) {
                 <span>${b.winRate} % des combats archivés</span>
             </div>
             <div class="compo-meta">
+                ${current ? '' : `<button type="button" class="link" data-try='${esc(JSON.stringify(b.types.map((t) => ({ key: t.key, qty: t.qty }))))}'>Essayer dans le simulateur</button>`}
                 <span>${num(b.slotsUsed)} places</span>
                 <span>DPS ${num(b.dps)}</span>
                 <span>PV ${num(b.hp)}</span>
@@ -865,6 +1603,7 @@ async function api(url, opts) {
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const num = (n) => (Number.isFinite(Number(n)) ? Number(n).toLocaleString('fr-FR') : '—');
 const pct = (x) => `${Math.round(x * 100)} %`;
+const fmtDate = (iso) => (iso ? new Date(iso).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' }) : '—');
 
 function when(ts) {
     if (!ts) return '—';

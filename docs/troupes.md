@@ -13,7 +13,7 @@
 - **Critique** — chance qu’un coup soit critique : tout le groupe frappe alors ×1,5.
 - **Riposte** — chance que le groupe frappé rende le coup à 60 % de ses dégâts (toutes les unités touchées d’un coup).
 - **Vitesse** — délai entre deux coups : plus il est court, plus l’unité frappe souvent.
-- **Niveau de type** — chaque type gagne de l’XP en combat jusqu’au niveau 50 : **+2 % de dégâts et de vie par niveau**, pour toutes tes unités de ce type.
+- **Niveau de type** — chaque type gagne de l’XP en combat jusqu’au niveau 50 : **+2 % de dégâts et de vie par niveau**, pour toutes tes unités de ce type. Le bonus est **additif** et non composé : au niveau *n*, une unité vaut `base × (1 + 2 % × (n − 1))`. Vérifié sur l’historique à équipement constant — un modèle composé dérive dès le niveau 3.
 
 Deux colonnes de valeurs pour chaque stat :
 
@@ -88,6 +88,8 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 **Niveau requis** 1 · **Rôle** Rapide · **Capacité** Embuscade · **Niveau de type** 3
 
+*Progression du type : 7 911 / 27 134 XP (29,2 %) avant le niveau 4 — il reste 19 223 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+
 *Twitchy and unpredictable, he hits fast. Anything for his next fix.*
 
 > **Embuscade** — Avant le combat, chacun de tes groupes frappe une fois, à 40 % de sa puissance.
@@ -104,7 +106,9 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 ### Racaille · *Scumbag*
 
-**Niveau requis** 1 · **Rôle** Défenseur · **Capacité** Bouclier · **Niveau de type** 3 · **Possédées** 29
+**Niveau requis** 1 · **Rôle** Défenseur · **Capacité** Bouclier · **Niveau de type** 3 · **Possédées** 30
+
+*Progression du type : 11 972 / 27 134 XP (44,1 %) avant le niveau 4 — il reste 15 162 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *The punk doesn’t look like much, but knows exactly where it hurts.*
 
@@ -122,7 +126,9 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 ### Lascar · *Hustler*
 
-**Niveau requis** 1 · **Rôle** Cogneur · **Capacité** Rage · **Niveau de type** 4 · **Possédées** 642
+**Niveau requis** 1 · **Rôle** Cogneur · **Capacité** Rage · **Niveau de type** 4 · **Possédées** 641
+
+*Progression du type : 35 918 / 47 891 XP (75 %) avant le niveau 5 — il reste 11 973 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *He didn’t invent sliced bread, but he hits hard. That’s it.*
 
@@ -142,6 +148,8 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 **Niveau requis** 5 · **Rôle** Rapide · **Capacité** Frénésie · **Niveau de type** 1
 
+*Progression du type : 430 / 2 100 XP (20,5 %) avant le niveau 2 — il reste 1 670 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+
 *No faith, no law: the thug always goes for the weak spot.*
 
 > **Frénésie** — Au début du combat, tes troupes frappent 50 % plus vite pendant 2 s.
@@ -160,6 +168,8 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 **Niveau requis** 10 · **Rôle** Défenseur · **Capacité** Second souffle · **Niveau de type** 3 · **Possédées** 118
 
+*Progression du type : 3 729 / 27 134 XP (13,7 %) avant le niveau 4 — il reste 23 405 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+
 *Sly and effective, the bandit is ready to serve at any moment.*
 
 > **Second souffle** — Une fois sous 30 % de vie, tes troupes récupèrent 12 % de leur vie.
@@ -176,7 +186,9 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 ### Brute
 
-**Niveau requis** 15 · **Rôle** Cogneur · **Capacité** Onde de choc · **Niveau de type** 1 · **Possédées** 86
+**Niveau requis** 15 · **Rôle** Cogneur · **Capacité** Onde de choc · **Niveau de type** 2 · **Possédées** 86
+
+*Progression du type : 2 332 / 11 546 XP (20,2 %) avant le niveau 3 — il reste 9 214 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *Beneath that shell of muscle lies a sensitive soul. Or not.*
 
@@ -184,8 +196,8 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
-| Vie | 3 270 | 4 071 |
-| Dégâts | 457 – 490 | 685 – 728 |
+| Vie | 3 335 | 4 153 |
+| Dégâts | 466 – 500 | 699 – 743 |
 | Critique | 25 % | 36,5 % |
 | Riposte | 3 % | 5 % |
 | Vitesse d’attaque | 1 coup / 2,2 s | 1 coup / 2,02 s |
