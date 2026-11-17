@@ -43,9 +43,9 @@ export async function serve({ port = 4173, host = '127.0.0.1' } = {}) {
         if (busy) throw httpError(409, `« ${busy} » est déjà en cours.`);
         busy = name;
         const lines = [];
-        const restore = captureLog((line) => {
-            lines.push(line);
-            push('progress', { task: name, line });
+        const restore = captureLog((entry) => {
+            lines.push(entry);
+            push('progress', { task: name, ...entry });
         });
         push('start', { task: name });
         try {
@@ -152,23 +152,26 @@ async function api(url, req, res, { run, withGame, busy }) {
         const maxTypes = Number(url.searchParams.get('types')) || crew.typeSlots || 4;
         const defReadiness = clamp(Number(url.searchParams.get('readiness')) || defaultReadiness(analysis), 0.1, 1);
         const bt = backtest(analysis, troops);
-        const result = recommend({
-            analysis,
-            troops,
-            slots,
-            maxTypes,
-            keep: 8,
-            threshold: bt.threshold,
-            readiness: { attack: 1, defense: defReadiness },
+        const search = (defense) => recommend({
+            analysis, troops, slots, maxTypes, keep: 8, threshold: bt.threshold,
+            readiness: { attack: 1, defense },
         });
-        return json(res, 200, { ok: true, compos: result, backtest: bt, readiness: defReadiness });
+        const result = search(defReadiness);
+        // Combien vaudrait la meilleure compo si tes troupes défendaient à pleine vie ? L'écart
+        // chiffre ce que coûte le fait d'être attaqué avant la fin de la récupération.
+        const healed = defReadiness >= 0.99 ? null : search(1).best?.[0] || null;
+        return json(res, 200, { ok: true, compos: result, backtest: bt, readiness: defReadiness, healed });
     }
 
     if (req.method !== 'POST') throw httpError(405, 'Méthode non autorisée.');
 
     if (route === 'fetch-fights') {
         const refresh = url.searchParams.get('refresh') === '1';
-        return json(res, 200, await run('Récupération des combats', () => withGame((s) => syncFights(s, { refresh }))));
+        // `syncFights` renvoie aussi toute la base en mémoire : inutile de la repousser au navigateur.
+        return json(res, 200, await run('Récupération des combats', () => withGame(async (s) => {
+            const { store, ...summary } = await syncFights(s, { refresh });
+            return summary;
+        })));
     }
     if (route === 'fetch-troops') {
         return json(res, 200, await run('Relevé des troupes', () => withGame((s) => syncTroops(s, {}))));
@@ -237,7 +240,7 @@ function captureLog(onLine) {
     for (const kind of kinds) {
         original[kind] = log[kind];
         log[kind] = (text) => {
-            onLine(`${kind} ${text}`);
+            onLine({ kind, text: String(text) });
             original[kind](text);
         };
     }

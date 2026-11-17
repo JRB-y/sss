@@ -10,6 +10,8 @@
     "explore": "node --env-file-if-exists=.env src/index.mjs explore",
     "rules": "node --env-file-if-exists=.env src/index.mjs rules",
     "troops": "node --env-file-if-exists=.env src/index.mjs troops",
+    "analyse": "node --env-file-if-exists=.env src/index.mjs analyse",
+    "ui": "node --env-file-if-exists=.env src/index.mjs ui",
     "all": "node --env-file-if-exists=.env src/index.mjs check fights",
     "postinstall": "playwright install chromium"
   },

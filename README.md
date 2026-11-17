@@ -16,11 +16,14 @@ cp .env.example .env        # puis renseigne SSS_EMAIL / SSS_PASSWORD
 ## Utilisation
 
 ```bash
+npm run ui         # interface locale → http://127.0.0.1:4173  (tout passe par là)
+
 npm run check      # connexion + vérifications → out/report.json + out/game.png
 npm run fights     # télécharge les combats absents → data/fights.json
 npm run all        # les deux
 npm run rules      # règles officielles du site → docs/regles.md (sans connexion)
 npm run troops     # fiches des troupes relevées en jeu → data/troops.json + docs/troupes.md
+npm run analyse    # bilan + compositions dans le terminal → out/analysis.json
 npm run explore    # dépose les réponses brutes du jeu dans data/raw/ (debug)
 ```
 
@@ -32,7 +35,70 @@ npm run check  -- --headed      # navigateur visible
 npm run fights -- --fresh       # ignore la session enregistrée, rejoue le formulaire
 npm run fights -- --raw         # garde le HTML des listes dans data/raw/
 npm run rules  -- --locale=en   # autre langue : fr (défaut), en, es, de, it
+npm run ui     -- --port=5000   # autre port pour l'interface
 ```
+
+## L'interface (`npm run ui`)
+
+Un petit serveur local (`src/server.mjs`, sans dépendance) sert `web/` et expose les mêmes
+traitements que la CLI. Rien n'est écrit vers le jeu : on lit, on analyse, on simule.
+
+| Écran | Ce qu'on y trouve |
+| --- | --- |
+| **Tableau de bord** | les trois boutons, ce qu'il y a en base, et le journal en direct |
+| **Les règles** | `docs/regles.md` rendu avec sommaire latéral et recherche |
+| **Les troupes** | `docs/troupes.md`, même traitement |
+| **Analyse des combats** | bilan, rendement par type, capacités gaspillées, vivier adverse, fiabilité du simulateur |
+| **Compositions** | les meilleures compositions trouvées, comparées à celle que tu as en ligne |
+
+Les boutons qui touchent au jeu ouvrent Chromium et se connectent : une seule tâche à la fois, et
+son avancement part en Server-Sent Events vers la page (panneau **Journal**).
+
+## Analyse des combats (`npm run analyse`, onglet Analyse)
+
+Tout vient des rapports de combat (`detail.fight.report`), une fois le format décodé :
+
+- `events` est la frise complète du combat, un tableau par coup :
+  `[t, camp, typeAttaquant, typeCible, dégâts, unitésVivantes, riposte]`. `t` est en **centièmes de
+  seconde** (`result.cs` = durée du combat dans la même unité), `unitésVivantes` vaut 0 quand la pile
+  est au complet, et la riposte compte comme des dégâts subis par l'attaquant.
+- Les dégâts d'un coup valent `unités vivantes × tirage(min…max) × (critique ? 1,5) × (1 − fortification)`,
+  et les unités vivantes suivent la part de PV restante du groupe. Vérifié coup par coup.
+- `abNeed` / `abOn` donnent le seuil d'activation retenu par le serveur (10 % des places) et les
+  capacités qui ont **réellement** fonctionné. C'est la mesure la plus utile : elle dit quelles
+  capacités une composition paie sans les utiliser.
+- `abilities` donne l'amplitude réelle de chaque capacité. Bouclier 8 % des PV de l'armée, second
+  souffle ≈ 11,3 %, **onde de choc ≈ 6,8 % des PV de l'armée adverse** — ce dernier chiffre n'est
+  documenté nulle part dans les règles.
+
+Deux résultats contre-intuitifs sortent de l'historique :
+
+- **Le triangle des rôles n'agit pas sur les dégâts.** À rôle d'attaquant donné, les dégâts par
+  unité ne dépendent pas du rôle de la cible (écarts < 2 % sur 1 798 coups, après normalisation par
+  combat et par type qui annule l'équipement). Le ciblage n'est pas non plus orienté par le rôle :
+  la cible est tirée au sort, pondérée par les PV.
+- **En défense, les piles démarrent à 70 % de leurs PV**, parce que l'attaque arrive avant la fin de
+  la récupération ; un attaquant part toujours à 100 %. C'est la première cause des défaites en
+  défense, loin devant la composition.
+
+## Simulateur et compositions (onglet Compositions)
+
+`src/sim.mjs` rejoue un combat de façon **déterministe** (espérances, pas de tirage) avec les
+mécaniques ci-dessus, puis cherche la meilleure composition.
+
+- **Recherche** : toutes les combinaisons de types débloqués (jusqu'à 4, ou 5 avec l'Annexe),
+  réparties par dixièmes des places — le seuil des capacités valant 10 % des places, chaque part non
+  nulle allume sa capacité — puis affinage par déplacements d'unités entre types.
+- **Score** : chaque composition est jouée contre **tous les adversaires de ton historique**, avec
+  leur fortification et ton état de troupes réel. Pas contre une cible théorique.
+- **Honnêteté** : `backtest()` rejoue l'historique à partir des seules informations d'avant-combat.
+  Le seuil de bascule est calé sur ces combats (un paramètre par rôle, sur la justesse *équilibrée*
+  pour que « prédire défaite à tous les coups » ne passe pas pour un bon modèle). L'interface
+  affiche la justesse obtenue, le pouvoir de classement (AUC) et la référence « tout perdu ».
+  À utiliser pour **classer** des compositions, pas pour promettre un résultat.
+
+> Ce qui n'est pas modélisé : renforts de famille, objets non encore forgés, capacités adverses mal
+> documentées (coup de grâce, corruption) et la dispersion des tirages de dégâts.
 
 Code de sortie : `0` si tout passe, `1` si un check échoue ou si un combat n'a pas pu être
 téléchargé — utilisable tel quel en cron ou en CI.
@@ -168,7 +234,11 @@ src/checks.mjs    les points vérifiés + rapport
 src/fights.mjs    listes → détails → fusion incrémentale
 src/troops.mjs    cartes du shop → data/troops.json + docs/troupes.md
 src/rules.mjs     règles publiques → docs/regles.md (sans navigateur)
+src/analyse.mjs   lecture des rapports de combat : tout le mesuré
+src/sim.mjs       simulateur de combat, backtest et recherche de compositions
+src/server.mjs    serveur local de l'interface (http + SSE, sans dépendance)
 src/explore.mjs   dump des réponses brutes (debug)
 src/index.mjs     CLI
+web/              l'interface (index.html, style.css, app.js)
 docs/             documents générés (versionnés)
 ```
