@@ -1,6 +1,7 @@
 import { cardStats, median, ABILITY_FR, ROLE_FR } from './analyse.mjs';
 import { atTypeLevel } from './gear.mjs';
 import { army, simulate, simulateMany } from './engine.mjs';
+import { applyLoadout, currentLoadouts } from './arsenal.mjs';
 
 /* Simulateur de combat et recherche de compositions.
 
@@ -157,13 +158,23 @@ function pileStats(p, params, { fortAgainstThem = 0, talents = null } = {}) {
  * Les stats viennent des valeurs **réelles** de la carte du shop, qui portent déjà tes talents et
  * ton équipement du moment. Surtout ne pas y réappliquer les talents : comptage double.
  */
-export function composeArmy(spec, params, { slots, fort = 0, guard = 0, readiness = 1, critMult = 1.5 } = {}) {
+export function composeArmy(spec, params, { slots, fort = 0, guard = 0, readiness = 1, critMult = 1.5, gearCtx = null } = {}) {
     const piles = [];
     const unknown = [];
-    for (const { key, qty } of spec || []) {
-        const t = params.get(key);
+    for (const { key, qty, gear } of spec || []) {
+        let t = params.get(key);
         if (!t) { unknown.push(key); continue; }
         if (!(qty > 0)) continue;
+        /* Équipement choisi à la main : les stats de la carte sont recalculées en DELTA depuis
+           l'équipement réellement porté (affixes exacts + bonus intrinsèques estimés de
+           l'arsenal). Même équipement → exactement les stats actuelles. */
+        if (gear && gearCtx?.arsenal) {
+            t = applyLoadout(t, gear, {
+                talents: gearCtx.talents || null,
+                arsenal: gearCtx.arsenal,
+                current: gearCtx.current?.[key] || null,
+            });
+        }
         piles.push({
             key: t.key,
             fr: t.fr,
@@ -181,10 +192,13 @@ export function composeArmy(spec, params, { slots, fort = 0, guard = 0, readines
             ability: t.ability,
             abilityFr: t.abilityFr,
             cost: t.cost,
+            loadout: t.loadout || null,
+            loadoutEstimated: t.loadoutEstimated || false,
         });
     }
     const built = army(piles, { slots, fort, guard, readiness, critMult });
     built.unknown = unknown;
+    built.customGear = piles.some((p) => p.loadout);
     return built;
 }
 
@@ -690,6 +704,84 @@ export function bestAgainstFight({
         },
         current: current ? { ...describe({ piles: current, score: score(current, [scenario], slots, opts) }, slots, 1, critMult), ...mcOf(mkMine(current)) } : null,
         actual: { won: fight.won },
+    };
+}
+
+/**
+ * Que forger en priorité ? Pour chaque type de ta composition actuelle et chaque pièce
+ * remplaçable, on rejoue TOUT l'historique avec la pièce candidate (affixes = médiane des bornes
+ * observées, bonus intrinsèque estimé de l'arsenal) et on classe par gain de marge moyenne ;
+ * le podium est départagé au Monte-Carlo. Seules les pièces à estimation solide concourent.
+ */
+export function forgeRanking({ analysis, troops, skills, arsenal, slots, readiness = {}, critMult = 1.5, keep = 10, mcRuns = 24 }) {
+    const params = typeParams(troops, analysis);
+    const current = currentComposition(troops, params, slots);
+    if (!current) return { empty: true, reason: 'Aucune troupe possédée : lance « Mettre à jour ».' };
+    const scenarios = buildScenarios(analysis, params);
+    if (!scenarios.length) return { empty: true, reason: 'Aucun combat en base.' };
+    const loads = currentLoadouts(analysis);
+    const talents = skills?.bonuses || null;
+    const opts = { threshold: {}, readiness, critMult };
+
+    const base = score(current, scenarios, slots, opts);
+    const basePWin = mcScore(current, scenarios, slots, opts, mcRuns);
+
+    const medianAffixes = (bounds) => Object.fromEntries(Object.entries(bounds || {})
+        .map(([stat, b]) => [stat, Math.round(((b.min + b.max) / 2) * 10) / 10]));
+
+    const candidates = [];
+    for (const p of current) {
+        const cur = loads[p.key];
+        if (!cur) continue;
+        for (const slot of ['weapon', 'armor', 'charm']) {
+            const curPiece = cur.find((g) => g.slot === slot) || null;
+            for (const it of arsenal.items.filter((i) => i.slot === slot)) {
+                for (const r of it.rarities) {
+                    if (curPiece && curPiece.item === it.item && curPiece.rarity === r.rarity) continue;
+                    const affixes = medianAffixes(r.affixes);
+                    const hasAffix = Object.keys(affixes).length > 0;
+                    // armes et protections : il faut une estimation solide du bonus caché ;
+                    // porte-bonheur : seuls les affixes comptent (bonus propre non isolable).
+                    if (slot !== 'charm' && !r.intrinsic.solid) continue;
+                    if (slot === 'charm' && !hasAffix) continue;
+                    const piece = { slot, item: it.item, name: it.name, rarity: r.rarity, rarityFr: r.fr, affixes };
+                    const newLoad = curPiece
+                        ? cur.map((g) => (g.slot === slot ? piece : g))
+                        : [...cur, piece];
+                    candidates.push({ type: p.key, fr: p.fr, slot, piece, newLoad, from: curPiece });
+                }
+            }
+        }
+    }
+
+    const armyOf = (c) => current.map((p) => (p.key === c.type
+        ? { ...applyLoadout(p, c.newLoad, { talents, arsenal, current: loads[c.type] }), qty: p.qty }
+        : p));
+    for (const c of candidates) {
+        c.margin = score(armyOf(c), scenarios, slots, opts).margin;
+        c.delta = c.margin - base.margin;
+    }
+    candidates.sort((a, b) => b.delta - a.delta);
+
+    const top = candidates.slice(0, keep).map((c) => ({
+        type: c.type,
+        fr: c.fr,
+        slot: c.slot,
+        slotFr: c.piece.slot === 'weapon' ? 'Arme' : c.piece.slot === 'armor' ? 'Protection' : 'Porte-bonheur',
+        from: c.from ? { item: c.from.item, name: c.from.name, rarity: c.from.rarity, rarityFr: c.from.rarityFr } : null,
+        to: c.piece,
+        deltaMargin: Math.round(c.delta * 1000) / 1000,
+        pWin: mcScore(armyOf(c), scenarios, slots, opts, mcRuns),
+    }));
+
+    return {
+        empty: false,
+        fights: scenarios.length,
+        candidates: candidates.length,
+        base: { margin: Math.round(base.margin * 1000) / 1000, pWin: basePWin },
+        top,
+        note: 'affixes pris à la médiane des bornes observées (la forge les tire au sort) ; bonus '
+            + 'intrinsèques estimés par recoupement — un gain faible est dans la marge d’erreur.',
     };
 }
 

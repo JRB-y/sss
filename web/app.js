@@ -51,6 +51,7 @@ const VIEWS = {
     adversaires: { title: 'Adversaires' },
     simulateur: { title: 'Simulateur' },
     compos: { title: 'Compositions' },
+    arsenal: { title: 'Arsenal' },
     regles: { title: 'Les règles', doc: 'regles.md' },
     troupes: { title: 'Les troupes', doc: 'troupes.md' },
     objets: { title: 'Les objets', doc: 'objets.md' },
@@ -70,6 +71,8 @@ async function show(route) {
     const meta = VIEWS[view];
 
     for (const el of $$('.view')) el.hidden = el.id !== `view-${view}`;
+    // Le simulateur vit en pleine hauteur : son en-tête est réduit pour lui laisser la place.
+    document.body.classList.toggle('is-simu', view === 'simulateur');
     // Une sous-page garde allumée l'entrée de menu dont elle dépend.
     const current = meta.parent || view;
     for (const a of $$('.nav a')) {
@@ -84,6 +87,7 @@ async function show(route) {
     if (view === 'simulateur' && !simu.types) await loadSimu();
     if (view === 'qg' && !state.hq) await loadHq();
     if (view === 'compos' && !state.compos) await runCompos({ silent: true });
+    if (view === 'arsenal' && !state.arsenal) await loadArsenal();
     if (view === 'combat') await openFight(arg);
     if (view === 'adversaire') await openEnemy(arg);
     if (restoringScroll) restoringScroll = false;
@@ -465,7 +469,7 @@ function renderAnalyse() {
             num(o.dpuPerHit),
             o.intervalMedian ? `${String(o.intervalMedian).replace('.', ',')} s` : '—',
             bonusCell(o.gearBonuses),
-            (o.topItems || []).map((i) => esc(i.name)).join(', ') || '—',
+            (o.topItems || []).map((i) => esc(i.fr || i.name)).join(', ') || '—',
             o.reinforcements ? num(o.reinforcements) : '—',
         ]),
         [0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1],
@@ -849,7 +853,7 @@ function gearCell(g) {
         .map(([k, v]) => `${v > 0 ? '+' : ''}${String(v).replace('.', ',')}${AFFIX_UNIT[k] || ''} ${AFFIX_FR[k] || k}`);
     return `<span class="item r-${g.rarity ?? 0}" title="${esc(g.rarityFr || '')}">
         ${itemIcon(g.item, g.rarity)}
-        <span class="item-txt"><b>${esc(g.name)}</b>${bonus.length ? `<small>${esc(bonus.join(' · '))}</small>` : ''}</span></span>`;
+        <span class="item-txt"><b>${esc(g.fr || g.name)}</b>${bonus.length ? `<small>${esc(bonus.join(' · '))}</small>` : ''}</span></span>`;
 }
 
 function bonusCell(b) {
@@ -930,16 +934,30 @@ function matches(haystack, query) {
  * @param items  [{ value, label, sub, avatar, name, search }]
  * @param onPick appelée avec la valeur choisie
  */
-function picker(host, { items, value, placeholder, onPick, empty = 'Aucun résultat.' }) {
+/**
+ * Liste filtrable. `collapsed: true` la transforme en champ de recherche seul : la liste ne
+ * s'ouvre qu'à la saisie (ou au bouton ▾), par-dessus le contenu au lieu de le pousser — c'est
+ * ce qu'on veut quand le choix est déjà rappelé ailleurs à l'écran.
+ */
+function picker(host, { items, value, placeholder, onPick, empty = 'Aucun résultat.', collapsed = false }) {
     host.innerHTML = `
-        <div class="picker">
-            <input type="search" class="picker-input" placeholder="${esc(placeholder)}"
-                autocomplete="off" aria-label="${esc(placeholder)}">
-            <ol class="picker-list" role="listbox"></ol>
+        <div class="picker${collapsed ? ' is-collapsed' : ''}">
+            <div class="picker-bar">
+                <input type="search" class="picker-input" placeholder="${esc(placeholder)}"
+                    autocomplete="off" aria-label="${esc(placeholder)}"
+                    role="combobox" aria-expanded="false" aria-autocomplete="list">
+                ${collapsed ? '<button type="button" class="picker-toggle" aria-label="Voir toute la liste">▾</button>' : ''}
+            </div>
+            <ol class="picker-list" role="listbox"${collapsed ? ' hidden' : ''}></ol>
         </div>`;
     const input = $('.picker-input', host);
     const list = $('.picker-list', host);
+    const toggle = $('.picker-toggle', host);
     let cursor = 0;
+
+    const isOpen = () => !list.hidden;
+    const open = () => { if (!collapsed) return; list.hidden = false; input.setAttribute('aria-expanded', 'true'); };
+    const close = () => { if (!collapsed) return; list.hidden = true; input.setAttribute('aria-expanded', 'false'); };
 
     const visible = () => items.filter((it) => !input.value.trim() || matches(it.search || it.label, input.value));
 
@@ -959,20 +977,42 @@ function picker(host, { items, value, placeholder, onPick, empty = 'Aucun résul
         if (cur) cur.scrollIntoView({ block: 'nearest' });
     };
 
-    const pick = (v) => { if (v != null) onPick(v); };
+    const pick = (v) => {
+        if (v == null) return;
+        // Le choix est rappelé juste en dessous (fiche de l'adversaire) : on referme et on vide,
+        // pour revenir à un simple champ de recherche.
+        if (collapsed) { input.value = ''; cursor = 0; close(); }
+        onPick(v);
+    };
 
-    input.addEventListener('input', () => { cursor = 0; draw(); });
+    input.addEventListener('input', () => {
+        cursor = 0;
+        if (collapsed) { if (input.value.trim()) open(); else close(); }
+        draw();
+    });
     input.addEventListener('keydown', (e) => {
         const xs = visible();
-        if (e.key === 'ArrowDown') { cursor = Math.min(cursor + 1, xs.length - 1); draw(); e.preventDefault(); }
+        if (e.key === 'ArrowDown') { open(); cursor = Math.min(cursor + 1, xs.length - 1); draw(); e.preventDefault(); }
         else if (e.key === 'ArrowUp') { cursor = Math.max(cursor - 1, 0); draw(); e.preventDefault(); }
-        else if (e.key === 'Enter') { pick(xs[cursor]?.value); e.preventDefault(); }
-        else if (e.key === 'Escape') { input.value = ''; cursor = 0; draw(); }
+        else if (e.key === 'Enter') { if (isOpen() || !collapsed) pick(xs[cursor]?.value); e.preventDefault(); }
+        else if (e.key === 'Escape') { input.value = ''; cursor = 0; close(); draw(); }
     });
     list.addEventListener('click', (e) => {
         const li = e.target.closest('[data-value]');
         if (li) pick(li.dataset.value);
     });
+    if (toggle) {
+        toggle.addEventListener('click', () => {
+            if (isOpen()) close();
+            else { open(); draw(); input.focus(); }
+        });
+    }
+    if (collapsed) {
+        // Un clic ailleurs referme : une liste ouverte par-dessus le contenu doit savoir partir.
+        document.addEventListener('pointerdown', (e) => {
+            if (isOpen() && !host.contains(e.target)) close();
+        });
+    }
 
     draw();
     return { focus: () => input.focus(), input };
@@ -1401,13 +1441,18 @@ const simu = { types: null, scenarios: null, fightId: null, piles: new Map(), so
 async function loadSimu() {
     const box = $('#simu-body');
     try {
-        const [types, scenarios] = await Promise.all([api('/api/types'), api('/api/scenarios')]);
+        const [types, scenarios, arsenal] = await Promise.all([
+            api('/api/types'), api('/api/scenarios'), api('/api/arsenal').catch(() => null),
+        ]);
         if (types.empty || scenarios.empty) {
             box.innerHTML = callout(types.reason || scenarios.reason, 'bad');
             return;
         }
         simu.types = types;
         simu.scenarios = scenarios.scenarios;
+        simu.arsenal = arsenal && !arsenal.empty ? arsenal : null;
+        simu.gear = new Map();
+        simu.gearPick = null;
         simu.fightId = simu.scenarios[0]?.fightId ?? null;
         useSource('current');
     } catch (e) {
@@ -1441,68 +1486,87 @@ const roomFor = (key) => Math.max(0, simu.types.slots - (simuUsed() - (simu.pile
 
 function renderSimu({ keepResult = true } = {}) {
     const box = $('#simu-body');
+    // La colonne de gauche défile sur elle-même : un re-rendu ne doit pas la ramener en haut,
+    // sinon ouvrir une pièce d'équipement fait « sauter » la liste des types.
+    const keepScroll = $('.simu-setup')?.scrollTop ?? 0;
     const t = simu.types;
     const sc = currentScenario();
     const used = simuUsed();
     const over = used > t.slots;
 
+    /* Deux colonnes qui tiennent dans la hauteur de l'écran : le réglage à gauche (il défile
+       sur lui-même quand la liste des types est longue), le résultat à droite — lancer un combat
+       ne doit jamais obliger à faire défiler la page pour voir le verdict. */
+    /* Trois étages : la recherche d'adversaire et les conditions en pleine largeur, la fiche de
+       l'adversaire choisi juste en dessous (pleine largeur aussi), puis deux colonnes — ma
+       composition à gauche, le résultat à droite. */
     box.innerHTML = `
         <div class="simu">
-            <section class="simu-setup">
-                <h2 class="block">1 · Contre qui</h2>
-                <div class="field">
-                    <label>Combat archivé — parcours la liste ou tape un nom</label>
-                    <div id="simu-foe"></div>
-                </div>
-                ${sc ? foeCard(sc) : ''}
-
-                <h2 class="block">2 · Avec quoi</h2>
-                <div class="seg-row">
-                    ${[['current', 'Ma compo actuelle'], ['fight', 'Celle de ce combat'], ['blank', 'Partir de zéro']]
-        .map(([k, label]) => `<button type="button" class="seg-btn${simu.source === k ? ' is-on' : ''}" data-source="${k}">${label}</button>`).join('')}
-                </div>
-                <div class="simu-bar ${over ? 'is-over' : ''}">
-                    <span><strong>${num(used)}</strong> / ${num(t.slots)} places${used < t.slots
-        ? ` <span style="color:var(--text-3)">· ${num(t.slots - used)} libre${t.slots - used > 1 ? 's' : ''}</span>` : ''}</span>
-                    <span class="meter"><i style="width:${Math.min(100, (100 * used) / t.slots)}%"></i></span>
-                    <span class="${simuTypes() > t.typeSlots ? 'v-bad' : ''}">${simuTypes()} / ${t.typeSlots} types</span>
-                </div>
-                ${over ? callout(`Cette composition demande <strong>${num(used - t.slots)}</strong> places de plus
-                    que tes ${num(t.slots)} : elle n’est pas alignable en jeu. Elle vient d’un combat où tu avais
-                    d’autres places. Touche à n’importe quelle quantité et elle reviendra dans le budget.`, 'bad') : ''}
-                <p class="note">Les places sont un budget <strong>commun</strong> : chaque curseur s’arrête à
-                    ce qui reste. Pour renforcer un type quand tout est distribué, baisse-en un autre d’abord.
-                    Une capacité ne s’allume qu’à partir de <strong>${num(t.need)}</strong> unités (10 % de tes
-                    places) — en dessous, le type la porte sans qu’elle agisse.</p>
-                <div class="simu-types">${t.types.map(typeRow).join('')}</div>
-
-                <h2 class="block">3 · Dans quelles conditions</h2>
-                <div class="controls">
-                    <div class="field">
-                        <label for="simu-role">Rôle</label>
+            <section class="simu-top">
+                <div id="simu-foe"></div>
+                <div class="simu-cond">
+                    <label class="simu-field" for="simu-role">Rôle
                         <select id="simu-role">
                             <option value="">celui du combat (${esc(sc?.role || '?')})</option>
                             <option value="attaque">j’attaque</option>
                             <option value="défense">je défends</option>
                         </select>
-                    </div>
-                    <div class="field">
-                        <label for="simu-ready">Forme de mes troupes <output id="simu-ready-out"></output></label>
-                        <input id="simu-ready" type="range" min="30" max="100" step="5"
-                            value="${Math.round((sc?.readiness ?? 1) * 100)}">
-                    </div>
-                    <button class="btn" data-simu-run>Lancer le combat</button>
+                    </label>
+                    <label class="simu-field simu-ready-field" for="simu-ready">Forme de mes troupes
+                        <span class="simu-ready-row">
+                            <input id="simu-ready" type="range" min="30" max="100" step="5"
+                                value="${Math.round((sc?.readiness ?? 1) * 100)}">
+                            <output id="simu-ready-out"></output>
+                        </span>
+                    </label>
+                    <button class="btn btn-run" data-simu-run>Lancer le combat</button>
                 </div>
-                <p class="note">En défense, tes piles démarrent rarement à 100 % : elles récupèrent encore
-                    du combat précédent. Le curseur part de la forme réellement mesurée sur ce combat-là.</p>
+            </section>
+
+            ${sc ? `<section class="simu-foecard">${foeCard(sc)}</section>` : ''}
+
+            <section class="simu-setup">
+                <div class="simu-compo-head">
+                    <div class="seg-row">
+                        ${[['current', 'Ma compo actuelle'], ['fight', 'Celle du combat'], ['blank', 'Partir de zéro']]
+        .map(([k, label]) => `<button type="button" class="seg-btn${simu.source === k ? ' is-on' : ''}" data-source="${k}">${label}</button>`).join('')}
+                    </div>
+                    <div class="simu-bar ${over ? 'is-over' : ''}">
+                        <span><strong>${num(used)}</strong>/${num(t.slots)} places</span>
+                        <span class="meter"><i style="width:${Math.min(100, (100 * used) / t.slots)}%"></i></span>
+                        <span class="${simuTypes() > t.typeSlots ? 'v-bad' : ''}">${simuTypes()}/${t.typeSlots} types</span>
+                    </div>
+                </div>
+                ${over ? callout(`<strong>${num(used - t.slots)}</strong> places de trop : composition non
+                    alignable en jeu. Touche à une quantité et elle reviendra dans le budget.`, 'bad') : ''}
+
+                <div class="simu-types">${t.types.map(typeRow).join('')}</div>
+
+                <p class="note simu-help">Budget <strong>commun</strong> de ${num(t.slots)} places ·
+                    capacité active à partir de <strong>${num(t.need)}</strong> unités ·
+                    survole une pièce d’équipement pour ses stats, clique pour la remplacer</p>
             </section>
 
             <section class="simu-result" id="simu-result">
-                ${keepResult && simu.result ? renderSimuResult(simu.result) : '<p class="empty">Lance le combat pour voir le déroulé.</p>'}
+                ${keepResult && simu.result ? renderSimuResult(simu.result) : `
+                    <div class="simu-idle">
+                        <p class="empty">Choisis un adversaire et une composition, puis lance le combat.</p>
+                    </div>`}
             </section>
         </div>`;
 
+    const setup = $('.simu-setup');
+    if (setup) setup.scrollTop = keepScroll;
+    // Un panneau fraîchement ouvert doit être visible, même s'il tombe sous le pli de la colonne.
+    const pick = $('.gear-pick', box);
+    if (pick) pick.scrollIntoView({ block: 'nearest' });
+
     wireSimu();
+    if (keepResult && simu.result) {
+        const host = $('#simu-result');
+        wireResultTabs(host, simu.result);
+        wireSimuExport(host, simu.result);
+    }
 }
 
 function foeCard(sc) {
@@ -1538,10 +1602,195 @@ function typeRow(t) {
             <span title="délai entre deux coups">${String(t.speed).replace('.', ',')} s</span>
             <span title="unités possédées aujourd’hui" style="color:var(--text-3)">${num(t.owned)} en stock</span>
         </div>
+        ${gearStrip(t.key)}
         <input class="type-range" type="range" min="0" max="${max}" step="1" value="${qty}" data-qty="${t.key}" aria-label="Quantité de ${esc(t.fr)}">
         <input class="type-num" type="number" min="0" max="${max}" value="${qty}" data-qty-num="${t.key}" aria-label="Quantité de ${esc(t.fr)}">
         <span class="type-ab ${qty ? (on ? 'is-on' : 'is-off') : ''}">${qty ? (on ? '✓ capacité' : `−${num(simu.types.need - qty)}`) : ''}</span>
+    </div>
+    ${simu.gearPick?.key === t.key ? gearPickPanel(t.key, simu.gearPick.slot) : ''}`;
+}
+
+/* ── L'équipement d'un type ────────────────────────────────────────────────── */
+
+/* Trois icônes sur la ligne du type : arme, protection, porte-bonheur. Survol = les stats de la
+   pièce, clic = la remplacer. Le simulateur calcule en DELTA depuis l'équipement réellement
+   porté, donc on ne peut éditer que les types déjà vus en combat (sinon le point de départ est
+   inconnu et le calcul serait faux). */
+const GEAR_SLOTS = ['weapon', 'armor', 'charm'];
+const SLOT_FR = { weapon: 'Arme', armor: 'Protection', charm: 'Porte-bonheur' };
+
+const gearKnown = (key) => Boolean(simu.arsenal?.loadouts?.[key]);
+const gearCurrent = (key) => (simu.arsenal?.loadouts?.[key] || []).map((g) => ({
+    slot: g.slot, item: g.item, rarity: g.rarity, affixes: { ...(g.affixes || {}) },
+}));
+const gearState = (key) => simu.gear?.get(key) || gearCurrent(key);
+const gearTouched = (key) => JSON.stringify(gearCurrent(key)) !== JSON.stringify(gearState(key));
+
+/** La pièce d'un emplacement, enrichie du catalogue (nom FR, rareté, bonus estimé). */
+function gearInfo(g) {
+    if (!g?.item) return null;
+    const it = simu.arsenal?.arsenal.items.find((x) => x.item === g.item);
+    const r = it?.rarities.find((x) => x.rarity === g.rarity);
+    return {
+        ...g,
+        fr: it?.fr || it?.name || g.item,
+        rarityFr: r?.fr || `r${g.rarity}`,
+        intrinsic: g.slot === 'armor' ? r?.intrinsic.hpPct : g.slot === 'weapon' ? r?.intrinsic.dmgPct : null,
+        solid: r?.intrinsic.solid !== false,
+    };
+}
+
+function gearStrip(key) {
+    if (!simu.arsenal) return '';
+    if (!gearKnown(key)) {
+        return `<span class="type-gear is-na"
+            title="Équipement inconnu : ce type n’a pas encore été vu dans un de tes combats">—</span>`;
+    }
+    const load = gearState(key);
+    const cur = gearCurrent(key);
+    return `<span class="type-gear">
+        ${GEAR_SLOTS.map((slot) => {
+        const g = load.find((x) => x.slot === slot);
+        const c = cur.find((x) => x.slot === slot);
+        const changed = JSON.stringify(g || null) !== JSON.stringify(c || null);
+        const open = simu.gearPick?.key === key && simu.gearPick?.slot === slot;
+        if (!g) {
+            return `<button type="button" class="gslot is-empty${open ? ' is-open' : ''}" data-gslot="${key}|${slot}"
+                aria-label="${SLOT_FR[slot]} : vide — cliquer pour en mettre une"></button>`;
+        }
+        return `<button type="button" class="gslot${changed ? ' is-mod' : ''}${open ? ' is-open' : ''}"
+            data-gslot="${key}|${slot}" aria-label="${esc(SLOT_FR[slot])} — cliquer pour remplacer">
+            ${itemIcon(g.item, g.rarity)}
+        </button>`;
+    }).join('')}
+    </span>`;
+}
+
+/* Le panneau de remplacement d'UN emplacement : la liste des pièces connues, avec ce qu'elles
+   apportent. Un clic suffit — les affixes sont pris à la médiane des bornes observées, puisque
+   la forge les tire au sort de toute façon. */
+function gearPickPanel(key, slot) {
+    const a = simu.arsenal.arsenal;
+    const cur = gearCurrent(key).find((x) => x.slot === slot);
+    const now = gearState(key).find((x) => x.slot === slot);
+    const rows = [];
+    for (const it of a.items.filter((x) => x.slot === slot)) {
+        for (const r of it.rarities) {
+            const intr = slot === 'armor' ? r.intrinsic.hpPct : slot === 'weapon' ? r.intrinsic.dmgPct : null;
+            const affix = Object.entries(r.affixes || {})
+                .map(([stat, b]) => `${AFFIX_FR[stat] || stat} +${fmtNum((b.min + b.max) / 2)}${b.unit === 'pts' ? '' : ' %'}`)
+                .join(' · ');
+            const isNow = now && now.item === it.item && now.rarity === r.rarity;
+            const isCur = cur && cur.item === it.item && cur.rarity === r.rarity;
+            rows.push({
+                sort: intr ?? -999,
+                html: `<button type="button" class="gpick-row${isNow ? ' is-now' : ''}"
+                    data-gpick="${key}|${slot}|${esc(it.item)}|${r.rarity}">
+                    ${itemIcon(it.item, r.rarity)}
+                    <span class="gpick-name">${esc(it.fr || it.name)}</span>
+                    <span class="chip ${r.rarity >= 2 ? 'chip-on' : 'chip-role'}">${esc(r.fr)}</span>
+                    <span class="gpick-bonus">${intr != null
+                    ? `<strong class="${intr >= 0 ? 'v-good' : 'v-bad'}">${intr >= 0 ? '+' : ''}${fmtNum(intr)} % ${slot === 'armor' ? 'vie' : 'dégâts'}</strong>${r.intrinsic.solid ? '' : ' ⚠'}`
+                    : ''}${affix ? `<small>${esc(affix)}</small>` : ''}</span>
+                    ${isCur ? '<span class="gpick-tag">portée</span>' : ''}
+                </button>`,
+            });
+        }
+    }
+    rows.sort((x, y) => y.sort - x.sort);
+
+    return `<div class="gear-pick" data-gear-pick="${key}">
+        <div class="gpick-head">
+            <strong>${esc(SLOT_FR[slot])}</strong>
+            <span style="color:var(--text-3)">clique une pièce pour la mettre ${slot === 'charm'
+        ? '— pour un porte-bonheur, seuls les affixes comptent' : '— classé par bonus estimé'}</span>
+            ${gearTouched(key) ? `<button type="button" class="link" data-gear-reset="${key}">↩ équipement d’origine</button>` : ''}
+            <button type="button" class="gpick-close" data-gear-close aria-label="Fermer">✕</button>
+        </div>
+        <div class="gpick-list">${rows.map((r) => r.html).join('')}</div>
     </div>`;
+}
+
+/* Le survol d'une pièce montre ses stats. Le panneau de gauche défile, donc l'infobulle est
+   posée en position fixe : sinon elle serait coupée au bord de la colonne. */
+let gearTip = null;
+
+function showGearTip(btn) {
+    const [key, slot] = btn.dataset.gslot.split('|');
+    const g = gearInfo(gearState(key).find((x) => x.slot === slot));
+    if (!gearTip) {
+        gearTip = document.createElement('div');
+        gearTip.className = 'gtip';
+        document.body.appendChild(gearTip);
+    }
+    if (!g) {
+        gearTip.innerHTML = `<strong>${esc(SLOT_FR[slot])}</strong><em>aucune pièce — clique pour en mettre une</em>`;
+    } else {
+        const affix = Object.entries(g.affixes || {})
+            .map(([stat, v]) => `${esc(AFFIX_FR[stat] || stat)} +${fmtNum(v)}${AFFIX_UNIT[stat] || ''}`);
+        const changed = JSON.stringify(gearCurrent(key).find((x) => x.slot === slot) || null) !== JSON.stringify(gearState(key).find((x) => x.slot === slot) || null);
+        gearTip.innerHTML = `
+            <strong>${esc(g.fr)}</strong>
+            <span class="gtip-sub">${esc(SLOT_FR[slot])} · ${esc(g.rarityFr)}${changed ? ' · <em>modifiée</em>' : ''}</span>
+            ${affix.length ? `<span class="gtip-line">Affixes : ${affix.join(' · ')}</span>` : '<span class="gtip-line">Aucun affixe</span>'}
+            ${g.intrinsic != null
+        ? `<span class="gtip-line">Bonus caché estimé : <strong>${g.intrinsic >= 0 ? '+' : ''}${fmtNum(g.intrinsic)} % ${slot === 'armor' ? 'de vie' : 'de dégâts'}</strong>${g.solid ? '' : ' (fragile)'}</span>`
+        : slot === 'charm' ? '<span class="gtip-line">Bonus propre non isolable : seuls les affixes comptent</span>' : ''}
+            <span class="gtip-hint">clique pour remplacer</span>`;
+    }
+    const r = btn.getBoundingClientRect();
+    gearTip.hidden = false;
+    const h = gearTip.offsetHeight;
+    gearTip.style.left = `${Math.min(r.left, window.innerWidth - gearTip.offsetWidth - 12)}px`;
+    gearTip.style.top = `${r.bottom + h + 8 > window.innerHeight ? r.top - h - 8 : r.bottom + 8}px`;
+}
+
+const hideGearTip = () => { if (gearTip) gearTip.hidden = true; };
+
+/** Les affixes d'une pièce fraîchement choisie : la médiane des bornes observées. */
+function medianAffixes(item, rarity) {
+    const it = simu.arsenal.arsenal.items.find((x) => x.item === item);
+    const rar = it?.rarities.find((x) => x.rarity === rarity);
+    return Object.fromEntries(Object.entries(rar?.affixes || {})
+        .map(([stat, b]) => [stat, Math.round(((b.min + b.max) / 2) * 10) / 10]));
+}
+
+function wireGear(box) {
+    for (const b of $$('[data-gslot]', box)) {
+        b.addEventListener('mouseenter', () => showGearTip(b));
+        b.addEventListener('mouseleave', hideGearTip);
+        b.addEventListener('focus', () => showGearTip(b));
+        b.addEventListener('blur', hideGearTip);
+        b.addEventListener('click', () => {
+            const [key, slot] = b.dataset.gslot.split('|');
+            hideGearTip();
+            simu.gearPick = (simu.gearPick?.key === key && simu.gearPick?.slot === slot)
+                ? null : { key, slot };
+            renderSimu();
+        });
+    }
+    for (const b of $$('[data-gpick]', box)) {
+        b.addEventListener('click', () => {
+            const [key, slot, item, rarity] = b.dataset.gpick.split('|');
+            const load = gearState(key).filter((g) => g.slot !== slot);
+            load.push({ slot, item, rarity: Number(rarity), affixes: medianAffixes(item, Number(rarity)) });
+            load.sort((x, y) => GEAR_SLOTS.indexOf(x.slot) - GEAR_SLOTS.indexOf(y.slot));
+            simu.gear.set(key, load);
+            if (!gearTouched(key)) simu.gear.delete(key);
+            simu.gearPick = null;
+            renderSimu();
+        });
+    }
+    for (const b of $$('[data-gear-reset]', box)) {
+        b.addEventListener('click', () => {
+            simu.gear.delete(b.dataset.gearReset);
+            simu.gearPick = null;
+            renderSimu();
+        });
+    }
+    for (const b of $$('[data-gear-close]', box)) {
+        b.addEventListener('click', () => { simu.gearPick = null; renderSimu(); });
+    }
 }
 
 function wireSimu() {
@@ -1553,6 +1802,7 @@ function wireSimu() {
     ready.addEventListener('input', sync);
 
     picker($('#simu-foe'), {
+        collapsed: true,
         items: simu.scenarios.map((s) => ({
             value: String(s.fightId),
             name: s.opponent.name,
@@ -1564,7 +1814,7 @@ function wireSimu() {
                 + s.army.piles.map((p) => p.fr).join(' '),
         })),
         value: simu.fightId,
-        placeholder: 'Chercher un adversaire…',
+        placeholder: 'Chercher un adversaire — tape un nom, ou ▾ pour la liste',
         onPick: (v) => {
             simu.fightId = Number(v);
             if (simu.source === 'fight') useSource('fight');
@@ -1600,6 +1850,7 @@ function wireSimu() {
     for (const el of $$('[data-qty]', box)) el.addEventListener('input', () => setQty(el.dataset.qty, el.value, 'range'));
     for (const el of $$('[data-qty-num]', box)) el.addEventListener('input', () => setQty(el.dataset.qtyNum, el.value, 'num'));
 
+    wireGear(box);
     $('[data-simu-run]').addEventListener('click', runSimu);
 }
 
@@ -1637,13 +1888,24 @@ async function runSimu() {
     const btn = $('[data-simu-run]');
     btn.disabled = true;
     btn.textContent = 'Combat en cours…';
+    $('#simu-result').classList.add('is-running');
     const host = $('#simu-result');
     try {
+        // Un équipement modifié force le mode « custom » : le rejeu fidèle n'a de sens qu'avec
+        // les pièces réellement portées ce jour-là.
+        const gearSet = simu.gear?.size > 0;
         const body = {
             opponent: { fightId: simu.fightId },
-            mine: simu.source === 'fight' && !touched()
+            mine: simu.source === 'fight' && !touched() && !gearSet
                 ? { mode: 'historic' }
-                : { mode: 'custom', piles: [...simu.piles].map(([key, qty]) => ({ key, qty })).filter((p) => p.qty > 0) },
+                : {
+                    mode: 'custom',
+                    piles: [...simu.piles].map(([key, qty]) => ({
+                        key,
+                        qty,
+                        ...(simu.gear?.has(key) ? { gear: simu.gear.get(key) } : {}),
+                    })).filter((p) => p.qty > 0),
+                },
             role: $('#simu-role').value || undefined,
             readiness: Number($('#simu-ready').value) / 100,
             slots: simu.types.slots,
@@ -1655,6 +1917,7 @@ async function runSimu() {
         });
         simu.result = res;
         host.innerHTML = renderSimuResult(res);
+        wireResultTabs(host, res);
         wireSimuExport(host, res);
     } catch (e) {
         host.innerHTML = callout(e.message, 'bad');
@@ -1662,6 +1925,7 @@ async function runSimu() {
         simu.running = false;
         btn.disabled = false;
         btn.textContent = 'Lancer le combat';
+        $('#simu-result').classList.remove('is-running');
     }
 }
 
@@ -1679,6 +1943,24 @@ function touched() {
 }
 
 /* ── Export d'une simulation pour un agent IA ──────────────────────────────── */
+
+/* Les onglets du résultat ne re-rendent que leur panneau : le verdict et la courbe restent en
+   place, et la position de la page ne bouge pas d'un pixel. */
+function wireResultTabs(host, res) {
+    for (const b of $$('[data-rtab]', host)) {
+        b.addEventListener('click', () => {
+            simu.resultTab = b.dataset.rtab;
+            for (const x of $$('[data-rtab]', host)) {
+                const on = x.dataset.rtab === simu.resultTab;
+                x.classList.toggle('is-on', on);
+                x.setAttribute('aria-selected', String(on));
+            }
+            const panel = $('#simu-panel', host);
+            panel.innerHTML = resultPanel(res, simu.resultTab);
+            wireSimuExport(panel, res);
+        });
+    }
+}
 
 function wireSimuExport(host, res) {
     const note = $('[data-copy-note]', host);
@@ -1815,96 +2097,114 @@ function renderSimuResult(res) {
     const c = r.chance;
     const fmt = (x) => String(x).replace('.', ',');
 
+    /* Tout ce qui compte tient à l'écran : verdict, chiffres clés et courbe. Le reste — détail
+       des piles, capacités, bilan contre l'historique, export, méthode — vit dans des onglets
+       qui se remplacent dans la même zone, sans rallonger la page. */
+    const tab = simu.resultTab || 'piles';
+    const tabs = [
+        ['piles', 'Pile par pile'],
+        ['ab', `Capacités${r.trace.abilities.length ? ` (${r.trace.abilities.length})` : ''}`],
+        ['all', 'Contre tous'],
+        ['md', 'Export IA'],
+        ['how', 'Méthode'],
+    ];
+
     return `
-        <div class="verdict ${tone}">
+        <div class="verdict verdict-compact ${tone}">
             <div class="verdict-main">
                 <span class="verdict-label">${label}</span>
-                <span class="verdict-sub">contre ${esc(res.setup.opponent.name)} · ${esc(res.setup.role)}</span>
-                ${mc ? `<span class="verdict-odds">tu gagnes <strong>${fmt(p)} %</strong> des
-                    ${num(mc.runs)} combats simulés avec de vrais tirages (${num(mc.wins)} victoires)</span>` : ''}
+                <span class="verdict-sub">contre ${esc(res.setup.opponent.name)} · ${esc(res.setup.role)}
+                    ${mc ? `· ${num(mc.wins)}/${num(mc.runs)} tirages gagnés` : ''}</span>
             </div>
             <dl class="verdict-stats">
                 ${mc ? `
-                <div><dt>Probabilité</dt><dd>${fmt(p)} %</dd></div>
-                <div><dt>Marge médiane</dt><dd>${mc.margin.p50 > 0 ? '+' : ''}${fmt(mc.margin.p50)}
-                    <small style="color:var(--text-3)">(${fmt(mc.margin.p10)} à ${fmt(mc.margin.p90)})</small></dd></div>
+                <div><dt>Victoires</dt><dd>${fmt(p)} %</dd></div>
+                <div><dt>Marge</dt><dd>${mc.margin.p50 > 0 ? '+' : ''}${fmt(mc.margin.p50)}
+                    <small>${fmt(mc.margin.p10)}…${fmt(mc.margin.p90)}</small></dd></div>
                 <div><dt>Durée</dt><dd>${fmt(mc.seconds.p50)} s
-                    <small style="color:var(--text-3)">(${fmt(mc.seconds.p10)}–${fmt(mc.seconds.p90)})</small></dd></div>
-                <div><dt>Mes PV restants</dt><dd>${pct(mc.left.A)}</dd></div>
+                    <small>${fmt(mc.seconds.p10)}–${fmt(mc.seconds.p90)}</small></dd></div>
+                <div><dt>Mes PV</dt><dd>${pct(mc.left.A)}</dd></div>
                 <div><dt>Les siens</dt><dd>${pct(mc.left.B)}</dd></div>` : `
                 <div><dt>Marge</dt><dd>${r.margin > 0 ? '+' : ''}${fmt(r.margin)}</dd></div>
                 <div><dt>Durée</dt><dd>${fmt(r.seconds)} s</dd></div>
-                <div><dt>Mes PV restants</dt><dd>${pct(r.left.A)}</dd></div>
+                <div><dt>Mes PV</dt><dd>${pct(r.left.A)}</dd></div>
                 <div><dt>Les siens</dt><dd>${pct(r.left.B)}</dd></div>`}
             </dl>
         </div>
 
-        ${mc && c ? oddsCallout(c, r, tossUp, mc) : ''}
-
-        <div class="export-row">
-            <button type="button" class="btn" data-simu-copy>Copier pour un agent IA</button>
-            <button type="button" class="btn" data-simu-dl>Télécharger .md</button>
-            <span class="note" style="margin:0">Toute la simulation en Markdown — armées, probabilité,
-                déroulé — à coller dans une conversation avec un agent IA.</span>
-            <span data-copy-note></span>
+        <div class="simu-chart">
+            ${hpChart(r.trace, res)}
+            <p class="note" style="margin:.2rem 0 0">Déroulé de la passe médiane${c ? ` · sur ton historique,
+                à marge comparable, tu as gagné ${c.wins} fois sur ${c.sample}` : ''}${replay
+        ? ` · <strong>ce jour-là : ${real.won ? 'victoire' : 'défaite'}</strong> en ${fmt(real.seconds)} s`
+        : ''}</p>
         </div>
 
-        ${replay
-        ? callout(`<strong>Rejeu fidèle.</strong> Avec ta composition de ce jour-là, la réalité a été
-            <strong>${real.won ? 'une victoire' : 'une défaite'}</strong> en ${fmt(real.seconds)} s.
-            ${tossUp
-        ? `Le simulateur donne ${fmt(p)} % de victoires : à ce niveau-là, l’issue se joue sur les
-               tirages de dégâts, pas sur la composition.
-               ${won === real.won ? 'Il penchait du bon côté cette fois.' : 'C’est le tirage qui a décidé, pas un défaut du modèle.'}`
-        : `Le simulateur donne <strong>${fmt(p)} % de victoires</strong> —
-               ${won === real.won ? 'il retrouve le bon vainqueur.' : 'il se trompe ici, et à cette probabilité ce n’est pas attendu.'}`}`,
-            tossUp ? null : (won === real.won ? 'good' : 'bad'))
-        : callout(`<strong>Ce jour-là tu as ${real.won ? 'gagné' : 'perdu'}</strong> avec
+        <div class="simu-tabs" role="tablist">
+            ${tabs.map(([k, label2]) => `<button type="button" role="tab" class="simu-tab${tab === k ? ' is-on' : ''}"
+                data-rtab="${k}" aria-selected="${tab === k}">${esc(label2)}</button>`).join('')}
+        </div>
+        <div class="simu-panel" id="simu-panel">${resultPanel(res, tab)}</div>`;
+}
+
+/* Le contenu d'un onglet de résultat. Chaque panneau défile sur lui-même : la page, elle, ne
+   bouge pas — c'est toute la raison d'être de ce découpage. */
+function resultPanel(res, tab) {
+    const r = res.result;
+    const mc = r.monteCarlo;
+    const real = res.real;
+    const fmt = (x) => String(x).replace('.', ',');
+
+    if (tab === 'piles') return simuPilesTable(res);
+
+    if (tab === 'ab') {
+        if (!r.trace.abilities.length) return '<p class="empty">Aucune capacité ne s’est déclenchée dans cette passe.</p>';
+        return `<ol class="ab-list">
+            ${r.trace.abilities.map(([t, side, key, amount]) => `<li class="${side === 0 ? 'is-mine' : 'is-theirs'}">
+                <span class="ab-t">${(t / 100).toFixed(2).replace('.', ',')} s</span>
+                <span class="ab-who">${side === 0 ? 'moi' : esc(res.setup.opponent.name)}</span>
+                <span class="ab-key">${esc(ABILITY_FR_UI[key] || key)}</span>
+                ${amount ? `<span class="ab-amount">${num(amount)}</span>` : ''}
+            </li>`).join('')}
+        </ol>`;
+    }
+
+    if (tab === 'all') {
+        if (!res.record) return '<p class="empty">Le bilan complet n’est disponible que pour une composition montée à la main.</p>';
+        return callout(`Un duel ne prouve rien tout seul. La même composition, jouée contre
+            <strong>les ${res.record.fights} combats</strong> de ton historique, en gagne
+            <strong>${res.record.wins}</strong> (${res.record.winRate} %) —
+            ${res.record.attack.wins}/${res.record.attack.fights} en attaque,
+            ${res.record.defense.wins}/${res.record.defense.fights} en défense.
+            <span style="color:var(--text-3)">Les combats défensifs sont rejoués à la forme réglée
+            (${pct(res.setup.readiness)}).</span>`, res.record.winRate >= 50 ? 'good' : null);
+    }
+
+    if (tab === 'md') {
+        return `<div class="export-row" style="margin:0">
+            <button type="button" class="btn" data-simu-copy>Copier pour un agent IA</button>
+            <button type="button" class="btn" data-simu-dl>Télécharger .md</button>
+            <span class="note" style="margin:0">Armées, probabilité, déroulé et limites — prêt à coller
+                dans une conversation pour demander conseil.</span>
+            <span data-copy-note></span>
+        </div>`;
+    }
+
+    // Méthode : la lecture honnête du chiffre, et comment il est obtenu.
+    const c = r.chance;
+    return `
+        ${mc && c ? oddsCallout(c, r, mc.pWin >= 25 && mc.pWin <= 75, mc) : ''}
+        ${real ? `<p class="note">Ce jour-là tu as <strong>${real.won ? 'gagné' : 'perdu'}</strong> avec
             ${real.myPiles.map((p) => `${esc(p.fr)}&nbsp;×${num(p.qty)}`).join(', ')}
-            (${fmt(real.seconds)} s, ${real.delta >= 0 ? '+' : ''}${real.delta} points).
-            Ci-dessus, le même adversaire affronté par la composition que tu viens de monter.`)}
-
-        <h3 class="block">Le déroulé <small style="color:var(--text-3);font-weight:normal">— la passe
-            la plus typique des ${mc ? num(mc.runs) : ''} tirages (issue médiane)</small></h3>
-        ${hpChart(r.trace, res)}
-
-        <h3 class="block">Pile par pile</h3>
-        ${simuPilesTable(res)}
-
-        ${r.trace.abilities.length ? `
-            <h3 class="block">Capacités déclenchées</h3>
-            <ol class="ab-list">
-                ${r.trace.abilities.map(([t, side, key, amount]) => `<li class="${side === 0 ? 'is-mine' : 'is-theirs'}">
-                    <span class="ab-t">${(t / 100).toFixed(2).replace('.', ',')} s</span>
-                    <span class="ab-who">${side === 0 ? 'moi' : esc(res.setup.opponent.name)}</span>
-                    <span class="ab-key">${esc(ABILITY_FR_UI[key] || key)}</span>
-                    ${amount ? `<span class="ab-amount">${num(amount)}</span>` : ''}
-                </li>`).join('')}
-            </ol>` : ''}
-
-        ${res.record ? `
-            <h3 class="block">Et contre tous les autres ?</h3>
-            ${callout(`Un duel ne prouve rien tout seul. La même composition, jouée contre
-                <strong>les ${res.record.fights} combats</strong> de ton historique, en gagne
-                <strong>${res.record.wins}</strong> (${res.record.winRate} %) —
-                ${res.record.attack.wins}/${res.record.attack.fights} en attaque,
-                ${res.record.defense.wins}/${res.record.defense.fights} en défense.
-                <span style="color:var(--text-3)">Les combats défensifs sont rejoués avec la forme
-                réglée ci-contre (${pct(res.setup.readiness)}) : baisse-la pour voir ce que donne une
-                armée qui n’a pas fini de récupérer.</span>`,
-            res.record.winRate >= 50 ? 'good' : null)}` : ''}
-
+            (${fmt(real.seconds)} s, ${real.delta >= 0 ? '+' : ''}${real.delta} points).</p>` : ''}
         <p class="note">Le moteur rejoue les <strong>mécaniques exactes du jeu</strong>, rétro-conçues
             depuis les frises de coups de ton archive : tirages uniformes min…max, vivants =
             ceil(PV ÷ PV unitaire), riposte min(cible, attaquant) × 0,6, bouclier en pool commun de
-            8 % des PV de départ, seuils et amplitudes mesurés des capacités (voir « Ce que
-            l’historique dit du moteur » dans l’onglet Analyse). Le jeu tire les dégâts et les
-            critiques au hasard — ton historique en contient la preuve : les combats 11055 et 11060
-            opposent les mêmes armées, l’un est gagné, l’autre perdu. Le verdict est donc une
-            <strong>probabilité</strong>, pas une promesse.
-            ${res.result.accuracy ? `Sur l’ensemble de ton historique, le moteur retrouve le bon
-            vainqueur dans ${res.result.accuracy} % des cas, en ne partant que des informations
-            d’avant-combat.` : ''}</p>`;
+            8 % des PV de départ, seuils et amplitudes mesurés des capacités. Le jeu tire les dégâts
+            au hasard — les combats 11055 et 11060 de ton archive opposent les mêmes armées, l’un est
+            gagné, l’autre perdu : le verdict est une <strong>probabilité</strong>, pas une promesse.
+            ${r.accuracy ? `Sur ton historique, le moteur retrouve le bon vainqueur dans ${r.accuracy} %
+            des cas, à partir des seules informations d’avant-combat.` : ''}</p>`;
 }
 
 /* Un simulateur déterministe donne toujours la même réponse pour la même situation. Le jeu, lui,
@@ -2198,6 +2498,137 @@ function gainText(best, current, need) {
         + (off.length ? ` Au passage, ${off.map((t) => `<strong>${esc(t.fr)}</strong>`).join(' et ')}
         ${off.length > 1 ? 'portent' : 'porte'} aujourd’hui une capacité éteinte, faute d’atteindre ${need} unités.` : '');
 }
+
+/* ── L'arsenal ─────────────────────────────────────────────────────────────── */
+
+async function loadArsenal() {
+    const box = $('#arsenal-body');
+    try {
+        const res = await api('/api/arsenal');
+        if (res.empty) { box.innerHTML = callout(res.reason, 'bad'); return; }
+        state.arsenal = res;
+        renderArsenal();
+    } catch (e) {
+        box.innerHTML = callout(e.message, 'bad');
+    }
+}
+
+function renderArsenal() {
+    const box = $('#arsenal-body');
+    const a = state.arsenal.arsenal;
+    const loadouts = state.arsenal.loadouts || {};
+
+    const wornBy = (item, rarity) => Object.entries(loadouts)
+        .filter(([, gear]) => gear.some((g) => g.item === item && g.rarity === rarity))
+        .map(([type]) => type);
+
+    const affixText = (affixes) => Object.entries(affixes || {})
+        .map(([stat, b]) => `${esc(AFFIX_FR[stat] || stat)} ${b.min === b.max ? fmtNum(b.min) : `${fmtNum(b.min)}–${fmtNum(b.max)}`}${b.unit === 'pts' ? ' pts' : ' %'}`)
+        .join(' · ') || '—';
+
+    const intrText = (it, r) => {
+        const i = r.intrinsic;
+        const v = it.slot === 'armor' ? i.hpPct : it.slot === 'weapon' ? i.dmgPct : null;
+        if (it.slot === 'charm') return '<span style="color:var(--text-3)">non isolable</span>';
+        if (v == null) return '—';
+        const label = it.slot === 'armor' ? 'vie' : 'dégâts';
+        return `<span class="${i.solid ? 'v-good' : ''}">${v >= 0 ? '+' : ''}${fmtNum(v)} % ${label}</span>`
+            + `${i.solid ? '' : ' <span class="v-bad" title="moins de 2 observations : estimation fragile">⚠</span>'}`;
+    };
+
+    const slotTable = (slot, title) => {
+        const rows = [];
+        for (const it of a.items.filter((x) => x.slot === slot)) {
+            for (const r of it.rarities) {
+                const worn = wornBy(it.item, r.rarity);
+                rows.push([
+                    `<span class="gear-name"><svg class="item-ico r-${r.rarity}" aria-hidden="true"><use href="/assets/icons.svg#${esc(it.icon)}"/></svg> ${esc(it.fr || it.name)}</span>`,
+                    `<span class="chip ${r.rarity >= 2 ? 'chip-on' : 'chip-role'}">${esc(r.fr)}</span>`,
+                    num(r.seen),
+                    affixText(r.affixes),
+                    intrText(it, r),
+                    r.intrinsic.speedPct != null ? `<span style="color:var(--text-3)">+${fmtNum(r.intrinsic.speedPct)} % ?</span>` : '—',
+                    worn.length ? worn.map((t) => `<span class="chip chip-on">${esc(t)}</span>`).join(' ') : '—',
+                ]);
+            }
+        }
+        return `<h2 class="block">${esc(title)}</h2>
+            ${dataTable(['Objet', 'Rareté', 'Vu en combat', 'Affixes observés (bornes)', 'Bonus caché estimé', 'Vitesse (indicatif)', 'Porté par mes'], rows, [0, 0, 1, 0, 1, 1, 0])}`;
+    };
+
+    box.innerHTML = `
+        ${callout(`<strong>Le bonus caché, mesuré par recoupement.</strong> Le jeu publie les affixes d’un
+            objet mais pas son bonus propre — qui est pourtant gros (un bandit vaut +10 % de PV en Leather
+            jacket et +37 % en Bomb suit, à niveau égal). Il est estimé ici en croisant les ${num(a.players)}
+            porteurs observés dans l’archive (médianes alternées, échelle recalée sur tes propres cartes).
+            Vie → protections, dégâts → armes ; le bonus propre des <strong>porte-bonheur</strong> n’est pas
+            isolable (seuls leurs affixes comptent), et la <strong>vitesse</strong> par pièce est trop
+            incertaine pour être utilisée dans les calculs — elle est affichée à titre indicatif avec un « ? ».`)}
+
+        <section class="forge-box">
+            <h2 class="block">Que forger en priorité ?</h2>
+            <p class="note">Chaque pièce candidate est jouée contre <strong>tous tes combats archivés</strong>
+                à la place de l’actuelle (affixes à la médiane des bornes — la forge les tire au sort), puis
+                le podium est départagé au Monte-Carlo. Seules les pièces à estimation solide concourent.</p>
+            <button class="btn" data-forge>Calculer le classement</button>
+            <div id="forge-result"></div>
+        </section>
+
+        ${slotTable('weapon', 'Armes')}
+        ${slotTable('armor', 'Protections')}
+        ${slotTable('charm', 'Porte-bonheur')}
+
+        <p class="note">« Vu en combat » compte les piles portant la pièce dans l’archive (les deux camps).
+            Les bornes d’affixes sont celles réellement observées — la forge peut en sortir de meilleures.
+            Une estimation marquée ⚠ repose sur moins de 2 observations.</p>`;
+
+    $('[data-forge]', box)?.addEventListener('click', async (e) => {
+        const out = $('#forge-result', box);
+        e.target.disabled = true;
+        e.target.textContent = 'Calcul en cours…';
+        try {
+            const r = await api('/api/forge', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+            out.innerHTML = renderForge(r);
+        } catch (err) {
+            out.innerHTML = callout(err.message, 'bad');
+        } finally {
+            e.target.disabled = false;
+            e.target.textContent = 'Calculer le classement';
+        }
+    });
+}
+
+function renderForge(r) {
+    const fmt = (x) => String(x ?? '—').replace('.', ',');
+    const best = r.top.filter((t) => t.pWin != null && t.pWin > r.base.pWin + 0.5);
+    return `
+        ${callout(`Ta composition actuelle gagne <strong>${fmt(r.base.pWin)} %</strong> des combats de ton
+            historique rejoués aux tirages réels. ${best.length
+        ? `La meilleure forge l’amènerait à <strong>${fmt(best[0].pWin)} %</strong>.`
+        : 'Aucune pièce testée ne fait clairement mieux : ton équipement est déjà au niveau.'}
+            <span style="color:var(--text-3)">${num(r.candidates)} pièces testées contre ${r.fights} combats ·
+            ${esc(r.note)}</span>`, best.length ? 'good' : null)}
+        ${r.top.map((t, i) => `
+            <article class="compo${i === 0 && best.length ? ' is-best' : ''}">
+                <div class="compo-rank">0${i + 1}</div>
+                <div class="compo-mix" style="align-items:center">
+                    <span class="unit">
+                        <img class="u-face" src="${unitFace(t.type)}" alt="" width="32" height="32" loading="lazy" onerror="this.remove()">
+                        <b>${esc(t.fr)}</b><span class="ab">${esc(t.slotFr)}</span>
+                    </span>
+                    <span style="color:var(--text-3)">${t.from ? `${esc(t.from.fr || t.from.name)} · ${esc(t.from.rarityFr || '')}` : 'rien'}</span>
+                    <span aria-hidden="true">→</span>
+                    <span><strong>${esc(t.to.fr || t.to.name)}</strong> <span class="chip ${t.to.rarity >= 2 ? 'chip-on' : 'chip-role'}">${esc(t.to.rarityFr)}</span>
+                        ${Object.keys(t.to.affixes || {}).length ? `<small style="color:var(--text-3)">affixes ${Object.entries(t.to.affixes).map(([k, v]) => `${esc(AFFIX_FR[k] || k)} +${fmtNum(v)}`).join(', ')}</small>` : ''}</span>
+                </div>
+                <div class="compo-score">
+                    <b class="${t.pWin > r.base.pWin ? 'v-good' : ''}">${fmt(t.pWin)} %</b>
+                    <span>${t.pWin > r.base.pWin ? '+' : ''}${fmt(Math.round((t.pWin - r.base.pWin) * 10) / 10)} pt vs actuel</span>
+                </div>
+            </article>`).join('')}`;
+}
+
+const fmtNum = (n) => String(Math.round(n * 10) / 10).replace('.', ',');
 
 /* ── Documents ─────────────────────────────────────────────────────────────── */
 

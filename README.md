@@ -71,6 +71,7 @@ traitements que la CLI. Rien n'est écrit vers le jeu : on lit, on analyse, on s
 | **Adversaires** | une fiche par joueur croisé : son armée, ses objets, l'historique daté de ses changements de troupes |
 | **Simulateur** | un duel contre un adversaire réel : rejoue un combat ou éprouve une composition montée à la main |
 | **Compositions** | les meilleures compositions trouvées, comparées à celle que tu as en ligne |
+| **Arsenal** | chaque objet × rareté : affixes observés, **bonus caché estimé**, et le classement « que forger en priorité » |
 | **Les règles / Les troupes / Les objets** | les documents générés, rendus avec sommaire latéral et recherche |
 
 **Un seul geste touche au jeu** : le bouton *Mettre à jour*, qui ouvre Chromium, se connecte,
@@ -144,6 +145,16 @@ Un duel joué coup par coup contre un adversaire **réel** de ton historique —
 > un type ne peut plus que baisser — pour en renforcer un, il faut d'abord en dégarnir un autre,
 > exactement comme en jeu.
 
+L'écran tient **dans la hauteur de l'écran**, en trois étages : la recherche d'adversaire avec le
+rôle, la forme des troupes et le bouton de lancement en pleine largeur — la liste des combats ne
+s'ouvre qu'à la saisie (ou au bouton ▾), en surcouche, et se referme dès qu'on a choisi ; la fiche de l'adversaire
+choisi juste en dessous, pleine largeur elle aussi ; puis deux colonnes — ma composition à gauche,
+le résultat à droite — qui défilent chacune sur elle-même. Lancer un combat n'oblige jamais à
+faire défiler la page (vérifié de 1280×720 à 1920×1080) : le verdict, les chiffres clés et la
+courbe sont là immédiatement, et les détails (pile par pile, capacités, bilan contre tout
+l'historique, export IA, méthode) vivent dans des **onglets** qui se remplacent dans la même zone
+au lieu de s'empiler.
+
 Ce que tu obtiens : la **probabilité de victoire** (le duel joué 600 fois avec de vrais tirages),
 la marge et la durée avec leur fourchette, la **courbe des PV des deux camps** (la passe la plus
 typique des 600) avec les capacités en repères, le détail pile par pile, la frise des capacités
@@ -152,6 +163,39 @@ déclenchées — et, pour éviter de conclure sur un seul duel, le bilan de la 
 
 Depuis l'onglet Compositions, chaque proposition a un bouton *Essayer dans le simulateur* qui la
 charge directement.
+
+### Changer l'équipement d'un type
+
+Chaque ligne de type porte, juste à côté de son portrait, les **trois pièces qu'il équipe** —
+arme, protection, porte-bonheur. Les survoler donne leurs stats (affixes exacts et bonus caché
+estimé), un clic ouvre la liste des pièces connues pour cet emplacement, **classée par ce qu'elle
+apporte** ; un second clic la met en jeu. Une pastille verte signale une pièce remplacée, et
+*↩ équipement d'origine* revient en arrière.
+
+Le calcul est fait **en delta** depuis l'équipement réellement porté — même équipement = exactement
+les stats de la carte — en appliquant les affixes exacts et le **bonus intrinsèque estimé** de
+l'arsenal. Un type jamais vu en combat n'est pas modifiable (son équipement porté est inconnu,
+donc le point de départ du delta le serait aussi).
+
+> **Les noms d'objets sont en français** (« Poing américain », « Combinaison renforcée »). Le jeu
+> les sert dans la langue du compte, et ce compte joue en anglais : la table de traduction vit dans
+> `src/gear.mjs` (`ITEM_FR`). Si tu passes ton compte en français, les noms servis par le jeu
+> reprennent automatiquement la main — ils font alors autorité.
+
+## L'arsenal (onglet Arsenal)
+
+Le jeu publie les affixes d'un objet mais pas son **bonus propre** — pourtant un bandit vaut
++10 % de PV en Leather jacket et +37 % en Bomb suit, à niveau égal. L'onglet Arsenal l'estime par
+recoupement de l'archive : chaque pile observée donne un résidu (PV servis ÷ expliqué, tirages
+mesurés ÷ expliqué), séparé en « talents du joueur » × « bonus des objets » par médianes
+alternées, l'échelle étant recalée sur mes propres cartes (vérité terrain). Vie → protections,
+dégâts → armes ; le bonus propre des porte-bonheur n'est pas isolable (seuls leurs affixes
+comptent) et la vitesse par pièce, trop incertaine, est affichée à titre indicatif sans jamais
+entrer dans un calcul.
+
+Le bouton **« Que forger en priorité ? »** rejoue tout l'historique avec chaque pièce candidate à
+la place de l'actuelle (affixes à la médiane des bornes observées) et classe par probabilité de
+victoire au Monte-Carlo — avec l'écart chiffré contre la composition actuelle.
 
 ### Pourquoi le verdict est une probabilité
 
@@ -570,6 +614,7 @@ src/skills.mjs    arbre de talents → data/skills.json (sépare talents et équ
 src/assets.mjs    images du jeu → data/assets/ (sans navigateur, URLs publiques)
 src/rules.mjs     règles publiques → docs/regles.md (sans navigateur)
 src/analyse.mjs   lecture des rapports de combat : tout le mesuré
+src/arsenal.mjs   bonus intrinsèques des objets (estimés par recoupement), équipement porté, deltas
 src/engine.mjs    le moteur de combat : mécaniques exactes du jeu, mode espérance + Monte-Carlo seedé
 src/sim.mjs       reconstruction des armées, mesures apprises par adversaire, backtest, compositions
 src/server.mjs    serveur local de l'interface (http + SSE, sans dépendance)

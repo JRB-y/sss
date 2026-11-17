@@ -112,6 +112,8 @@ export function army(piles, { slots, fort = 0, guard = 0, readiness = 1, critMul
             abilityOn: Boolean(p.ability) && p.qty >= need,
             cost: p.cost || null,
             source: p.source || null,
+            loadout: p.loadout || null,
+            loadoutEstimated: p.loadoutEstimated || false,
         };
     });
     return {

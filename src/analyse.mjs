@@ -158,7 +158,7 @@ function readFight(id, entry, report, meId) {
                écarts entre coups : c'est la cadence de croisière, hors accélérations. */
             intervalCs: stableInterval(hitTimes[side][p.key] || []),
             gear: gear.map((g) => ({
-                slot: g.slot, slotFr: g.slotFr, item: g.item, name: g.name,
+                slot: g.slot, slotFr: g.slotFr, item: g.item, name: g.name, fr: g.fr || g.name,
                 rarity: g.rarity, rarityFr: g.rarityFr, affixes: g.affixes, bonuses: g.labels,
             })),
             // Somme des affixes des trois emplacements : le seul bonus d'équipement que le jeu
@@ -499,7 +499,7 @@ function opponents(rows) {
             e.bonuses.push(p.gearBonuses || {});
             for (const g of p.gear || []) {
                 const k = `${g.slot}/${g.item}`;
-                const it = e.items.get(k) || { slot: g.slot, slotFr: g.slotFr, item: g.item, name: g.name, n: 0 };
+                const it = e.items.get(k) || { slot: g.slot, slotFr: g.slotFr, item: g.item, name: g.name, fr: g.fr || g.name, n: 0 };
                 it.n += 1;
                 e.items.set(k, it);
             }

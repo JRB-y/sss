@@ -14,9 +14,10 @@ import { syncHq } from './hq.mjs';
 import { buildReport, buildFightReport } from './report.mjs';
 import { measureCritMultiplier, measureCritRates } from './fightlog.mjs';
 import {
-    backtest, recommend, calibrateCrit, typeParams, composeArmy, bestAgainstFight,
+    backtest, recommend, calibrateCrit, typeParams, composeArmy, bestAgainstFight, forgeRanking,
     enemyArmyFromFight, myArmyOfFight, simulate, simulateMany, winChance, opponentFactors,
 } from './sim.mjs';
+import { buildArsenal, currentLoadouts } from './arsenal.mjs';
 import { log, readJson } from './util.mjs';
 
 /* Serveur local : il sert l'interface de web/ et expose les mêmes traitements que la CLI.
@@ -109,6 +110,31 @@ export async function serve({ port = 4173, host = '127.0.0.1' } = {}) {
     log.pass(`ouvre ${address}`);
     log.dim('Ctrl+C pour arrêter.');
     return { server, address };
+}
+
+/* L'arsenal (bonus intrinsèques estimés) coûte un passage sur toute l'archive : on le met en
+   cache tant que les données n'ont pas bougé. */
+let arsenalCache = null;
+
+async function getArsenalBundle() {
+    const [fights, troops, items, skills] = await Promise.all([
+        readJson(config.paths.fights), readJson(config.paths.troops),
+        readJson(config.paths.items), readJson(config.paths.skills),
+    ]);
+    const key = `${fights?.updatedAt}|${troops?.updatedAt}|${items?.updatedAt}|${skills?.updatedAt}`;
+    if (arsenalCache?.key === key) return arsenalCache.value;
+    const analysis = await loadAnalysis();
+    if (analysis.empty) return { empty: true, reason: analysis.reason };
+    const value = {
+        empty: false,
+        analysis,
+        troops,
+        skills,
+        arsenal: buildArsenal({ analysis, troops, items, skills }),
+        loadouts: currentLoadouts(analysis),
+    };
+    arsenalCache = { key, value };
+    return value;
 }
 
 /* ---------- API ---------- */
@@ -326,6 +352,18 @@ async function api(url, req, res, { run, withGame, busy }) {
         return res.end(md);
     }
 
+    /* L'arsenal : chaque objet × rareté avec ses affixes observés ET son bonus intrinsèque
+       estimé (celui que le jeu n'écrit nulle part), plus l'équipement porté par chaque type. */
+    if (route === 'arsenal') {
+        const bundle = await getArsenalBundle();
+        if (bundle.empty) return json(res, 200, { ok: true, empty: true, reason: bundle.reason });
+        return json(res, 200, {
+            ok: true,
+            arsenal: bundle.arsenal,
+            loadouts: bundle.loadouts,
+        });
+    }
+
     if (route === 'items') {
         const store = await readJson(config.paths.items);
         if (!store) return json(res, 200, { ok: true, empty: true, reason: 'Catalogue d’objets non construit.' });
@@ -456,6 +494,23 @@ async function api(url, req, res, { run, withGame, busy }) {
        Rendue sur la fiche du combat, avec sa probabilité de victoire au Monte-Carlo. */
     if (route === 'best-compo') {
         return json(res, 200, await runBestCompo(await readBody(req)));
+    }
+
+    /* Que forger en priorité ? Chaque pièce candidate rejouée contre tout l'historique. */
+    if (route === 'forge') {
+        const body = await readBody(req);
+        const bundle = await getArsenalBundle();
+        if (bundle.empty) throw httpError(409, bundle.reason);
+        const { analysis, troops, skills, arsenal } = bundle;
+        const critMult = (await fittedCrit(analysis, troops, skills)) ?? 1.5;
+        const slots = clamp(Number(body.slots) || troops.crew?.slots || 875, 10, 100000);
+        const defReadiness = clamp(Number(body.readiness) || defaultReadiness(analysis), 0.1, 1);
+        const result = forgeRanking({
+            analysis, troops, skills, arsenal, slots, critMult,
+            readiness: { attack: 1, defense: defReadiness },
+        });
+        if (result.empty) throw httpError(409, result.reason);
+        return json(res, 200, { ok: true, ...result, readiness: defReadiness });
     }
 
     if (route === 'fetch-fights') {
@@ -644,8 +699,15 @@ async function runSimulation(body) {
        progresser la justesse du rejeu (AUC 0,80 → 0,91). */
     const factors = opponentFactors(analysis, params, { talents: skills?.bonuses || null });
     const theirs = enemyArmyFromFight(fight, params, { role, factors });
+    // L'équipement choisi à la main passe par l'arsenal (affixes exacts + intrinsèques estimés).
+    const bundle = await getArsenalBundle();
+    const gearCtx = bundle.empty ? null : {
+        arsenal: bundle.arsenal,
+        talents: skills?.bonuses || null,
+        current: bundle.loadouts,
+    };
     const mine = buildMine(body, fight, params, skills, {
-        slots, critMult, readiness, factors,
+        slots, critMult, readiness, factors, gearCtx,
         fort: role === 'défense' ? fight.fort.mine : 0,
         guard: role === 'défense' ? fight.guard : 0,
     });
@@ -759,12 +821,38 @@ function buildMine(body, fight, params, skills, opts) {
     }
 
     const spec = mode === 'custom'
-        ? (body.mine.piles || []).map((p) => ({ key: String(p.key), qty: Math.max(0, Number(p.qty) || 0) }))
+        ? (body.mine.piles || []).map((p) => ({
+            key: String(p.key),
+            qty: Math.max(0, Number(p.qty) || 0),
+            gear: sanitizeGear(p.gear),
+        }))
         : currentSpec(params, body);
     const a = composeArmy(spec, params, opts);
-    a.source = mode === 'custom' ? 'composition montée à la main' : 'ta composition actuelle';
+    const gearNote = a.customGear ? ', équipement choisi à la main' : '';
+    a.source = (mode === 'custom' ? 'composition montée à la main' : 'ta composition actuelle') + gearNote;
     a.spec = spec.filter((p) => p.qty > 0);
     return a;
+}
+
+/** Un équipement envoyé par la page, borné à ce qu'on sait représenter. */
+function sanitizeGear(gear) {
+    if (!Array.isArray(gear) || !gear.length) return null;
+    const out = [];
+    for (const g of gear) {
+        if (!g || !['weapon', 'armor', 'charm'].includes(g.slot)) continue;
+        const affixes = {};
+        for (const stat of ['dmg', 'hp', 'speed', 'crit', 'riposte']) {
+            const v = Number(g.affixes?.[stat]);
+            if (Number.isFinite(v) && v !== 0) affixes[stat] = clamp(v, 0, 50);
+        }
+        out.push({
+            slot: g.slot,
+            item: String(g.item || '').slice(0, 40),
+            rarity: clamp(Math.round(Number(g.rarity) || 0), 0, 5),
+            affixes,
+        });
+    }
+    return out.length ? out : null;
 }
 
 function currentSpec(params, body) {
@@ -820,6 +908,8 @@ function armySummary(a, { slots = null } = {}) {
             dmgAvg: Math.round(p.dmgAvg), crit: p.crit, counter: p.counter, speed: p.speed,
             roleFr: p.roleFr, abilityFr: p.abilityFr, abilityOn: p.abilityOn,
             dps: Math.round((p.qty * p.dmgAvg) / (p.speed || 1)),
+            loadout: p.loadout || null,
+            loadoutEstimated: p.loadoutEstimated || false,
         })),
     };
 }

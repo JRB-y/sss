@@ -2,7 +2,7 @@
 
 > Les 21 types de troupes : rôle, capacité spéciale, stats, coût de recrutement.
 
-*Relevé dans le jeu (`/play/view/units?cat=troops`) le 2026-11-17 avec le compte **JoeyJr** (niveau 19). Règles générales : [docs/regles.md](regles.md).*
+*Relevé dans le jeu (`/play/view/units?cat=troops`) le 2026-11-17 avec le compte **JoeyJr** (niveau 20). Règles générales : [docs/regles.md](regles.md).*
 
 > ⚠️ L'interface de ce compte est réglée en `en` et le jeu ignore `Accept-Language` comme les paramètres d'URL : les **noms d'unité, descriptions et libellés relevés sont dans cette langue**. Les noms et effets français viennent des règles publiques. Passer le compte en français (téléphone › Réglages) ferait tout remonter en français.
 
@@ -30,8 +30,8 @@ Deux colonnes de valeurs pour chaque stat :
 | 5 | **Voyou** | Thug | `voyou` | Rapide | Frénésie | ✅ |
 | 10 | **Bandit** | — | `bandit` | Défenseur | Second souffle | ✅ |
 | 15 | **Brute** | — | `brute` | Cogneur | Onde de choc | ✅ |
-| 20 | **Diablesse** | She-devil | `diablesse` | Rapide | — | 👁 |
-| 26 | **Braqueur** | Robber | `braqueur` | Cogneur | — | 🔒 |
+| 20 | **Diablesse** | She-devil | `diablesse` | Rapide | Embuscade | ✅ |
+| 26 | **Braqueur** | Robber | `braqueur` | Cogneur | — | 👁 |
 | 33 | **Tueur à gages** | Hitman | `tueur_a_gage` | Défenseur | — | 🔒 |
 | 37 | **Gros Bras** | Muscle | `gros_bras` | Cogneur | — | 🔒 |
 | 41 | **Assassin** | — | `assassin` | Rapide | — | 🔒 |
@@ -65,7 +65,7 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 | Capacité | Effet | Portée par |
 | --- | --- | --- |
-| **Embuscade** | Avant le combat, chacun de tes groupes frappe une fois, à 40 % de sa puissance. | Junkie |
+| **Embuscade** | Avant le combat, chacun de tes groupes frappe une fois, à 40 % de sa puissance. | Junkie, Diablesse |
 | **Gel du temps** | Au début du combat, les troupes adverses sont figées 0,5 s. | — |
 | **Frénésie** | Au début du combat, tes troupes frappent 50 % plus vite pendant 2 s. | Voyou |
 | **Bouclier** | Un bouclier absorbe les premiers dégâts : 8 % de la vie de tes troupes. | Racaille |
@@ -99,7 +99,7 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
 | Vie | 2 246 | 2 246 |
-| Dégâts | 237 – 248 | 375 – 388 |
+| Dégâts | 237 – 248 | 381 – 394 |
 | Critique | 10 % | 15 % |
 | Riposte | 4 % | 4 % |
 | Vitesse d’attaque | 1 coup / 0,75 s | 1 coup / 0,72 s |
@@ -110,9 +110,9 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 ![Racaille](/assets/units/racaille.webp)
 
-**Niveau requis** 1 · **Rôle** Défenseur · **Capacité** Bouclier · **Niveau de type** 3 · **Possédées** 113
+**Niveau requis** 1 · **Rôle** Défenseur · **Capacité** Bouclier · **Niveau de type** 3 · **Possédées** 115
 
-*Progression du type : 13 813 / 27 134 XP (50,9 %) avant le niveau 4 — il reste 13 321 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+*Progression du type : 14 960 / 27 134 XP (55,1 %) avant le niveau 4 — il reste 12 174 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *The punk doesn’t look like much, but knows exactly where it hurts.*
 
@@ -121,7 +121,7 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
 | Vie | 3 224 | 3 563 |
-| Dégâts | 239 – 260 | 428 – 457 |
+| Dégâts | 239 – 260 | 436 – 465 |
 | Critique | 5 % | 13 % |
 | Riposte | 55 % | 56,5 % |
 | Vitesse d’attaque | 1 coup / 1,5 s | 1 coup / 1,3 s |
@@ -134,7 +134,7 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 **Niveau requis** 1 · **Rôle** Cogneur · **Capacité** Rage · **Niveau de type** 4 · **Possédées** 151
 
-*Progression du type : 39 175 / 47 891 XP (81,8 %) avant le niveau 5 — il reste 8 716 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+*Progression du type : 40 495 / 47 891 XP (84,6 %) avant le niveau 5 — il reste 7 396 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *He didn’t invent sliced bread, but he hits hard. That’s it.*
 
@@ -143,7 +143,7 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
 | Vie | 3 265 | 4 293 |
-| Dégâts | 457 – 490 | 803 – 853 |
+| Dégâts | 457 – 490 | 817 – 867 |
 | Critique | 25 % | 43 % |
 | Riposte | 3 % | 8,5 % |
 | Vitesse d’attaque | 1 coup / 2,2 s | 1 coup / 2,18 s |
@@ -165,7 +165,7 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
 | Vie | 2 200 | 2 200 |
-| Dégâts | 233 – 243 | 367 – 379 |
+| Dégâts | 233 – 243 | 373 – 385 |
 | Critique | 10 % | 15 % |
 | Riposte | 4 % | 4 % |
 | Vitesse d’attaque | 1 coup / 0,75 s | 1 coup / 0,72 s |
@@ -178,7 +178,7 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 **Niveau requis** 10 · **Rôle** Défenseur · **Capacité** Second souffle · **Niveau de type** 3 · **Possédées** 543
 
-*Progression du type : 8 147 / 27 134 XP (30 %) avant le niveau 4 — il reste 18 987 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+*Progression du type : 10 738 / 27 134 XP (39,6 %) avant le niveau 4 — il reste 16 396 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *Sly and effective, the bandit is ready to serve at any moment.*
 
@@ -187,7 +187,7 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
 | Vie | 3 359 | 4 048 |
-| Dégâts | 249 – 270 | 480 – 513 |
+| Dégâts | 249 – 270 | 488 – 521 |
 | Critique | 5 % | 19,5 % |
 | Riposte | 55 % | 57,5 % |
 | Vitesse d’attaque | 1 coup / 1,5 s | 1 coup / 1,46 s |
@@ -198,9 +198,9 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 ![Brute](/assets/units/brute.webp)
 
-**Niveau requis** 15 · **Rôle** Cogneur · **Capacité** Onde de choc · **Niveau de type** 2 · **Possédées** 108
+**Niveau requis** 15 · **Rôle** Cogneur · **Capacité** Onde de choc · **Niveau de type** 2 · **Possédées** 166
 
-*Progression du type : 7 275 / 11 546 XP (63 %) avant le niveau 3 — il reste 4 271 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+*Progression du type : 10 623 / 11 546 XP (92 %) avant le niveau 3 — il reste 923 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
 
 *Beneath that shell of muscle lies a sensitive soul. Or not.*
 
@@ -209,7 +209,7 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
 | Vie | 3 335 | 4 153 |
-| Dégâts | 466 – 500 | 699 – 743 |
+| Dégâts | 466 – 500 | 711 – 755 |
 | Critique | 25 % | 36,5 % |
 | Riposte | 3 % | 5 % |
 | Vitesse d’attaque | 1 coup / 2,2 s | 1 coup / 2,02 s |
@@ -220,19 +220,41 @@ Une capacité agit sur **toute ton armée**, mais seulement si tu engages au moi
 
 ![Diablesse](/assets/units/diablesse.webp)
 
-**Niveau requis** 20 · **Rôle** Rapide · **Capacité** — · **Niveau de type** 1
+**Niveau requis** 20 · **Rôle** Rapide · **Capacité** Embuscade · **Niveau de type** 1
 
-> 👁 **Avant-première** — type encore verrouillé : le jeu en donne les chiffres mais pas le rôle ni la capacité.
+*Progression du type : 0 / 2 100 XP (0 %) avant le niveau 2 — il reste 2 100 XP à gagner en combat, et le palier vaudra +2 % de vie et de dégâts pour toutes tes unités de ce type.*
+
+*Don’t trust appearances: she will surprise you.*
+
+> **Embuscade** — Avant le combat, chacun de tes groupes frappe une fois, à 40 % de sa puissance.
 
 | Stat | Base | Réel (ce compte) |
 | --- | --- | --- |
 | Vie | 2 340 | 2 340 |
-| Dégâts | 247 – 258 | 384 – 397 |
+| Dégâts | 247 – 258 | 390 – 403 |
 | Critique | 10 % | 15 % |
 | Riposte | 4 % | 4 % |
 | Vitesse d’attaque | 1 coup / 0,75 s | 1 coup / 0,72 s |
 
 **Coût d’un recrutement** — 130 $ · 50 alcool · 55 herbe · 120 poudre
+
+### Braqueur · *Robber*
+
+![Braqueur](/assets/units/braqueur.webp)
+
+**Niveau requis** 26 · **Rôle** Cogneur · **Capacité** — · **Niveau de type** 1
+
+> 👁 **Avant-première** — type encore verrouillé : le jeu en donne les chiffres mais pas le rôle ni la capacité.
+
+| Stat | Base | Réel (ce compte) |
+| --- | --- | --- |
+| Vie | 3 400 | 3 400 |
+| Dégâts | 476 – 510 | 672 – 713 |
+| Critique | 25 % | 30 % |
+| Riposte | 3 % | 3 % |
+| Vitesse d’attaque | 1 coup / 2,2 s | 1 coup / 2,11 s |
+
+**Coût d’un recrutement** — 150 $ · 80 alcool · 85 herbe · 90 poudre
 
 ## Les filles
 

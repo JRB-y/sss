@@ -50,6 +50,65 @@ export const AFFIXES = {
 
 export const AFFIX_KEYS = Object.keys(AFFIXES);
 
+/* Noms français des objets.
+
+   Le jeu sert le nom d'un objet dans la langue du COMPTE (`boot.locale`), et ce compte est en
+   anglais : les rapports de combat donnent donc « Brass knuckles », pas « Poing américain ».
+   Aucune vue du jeu ni aucune page publique ne publie la liste traduite (vérifié : règles dans
+   les cinq langues, vues du téléphone, bundle `app.js` — l'i18n du client ne couvre que les
+   libellés d'interface, pas le catalogue d'objets).
+
+   Cette table est donc une **traduction maison**, utilisée uniquement tant que le jeu répond en
+   anglais : si tu passes ton compte en français, `itemFr()` reprend automatiquement le nom servi
+   par le jeu, qui fait autorité. */
+export const ITEM_FR = {
+    // armes
+    ak47: 'AK-47',
+    knuckles: 'Poing américain',
+    shotgun: 'Fusil à pompe',
+    uzi: 'Uzi',
+    knife: 'Couteau de combat',
+    m16: 'M16',
+    glokk: 'Glokk 17',
+    bat: 'Batte cloutée',
+    little_friend: 'Lance-grenades',
+    sniper: 'Fusil de précision',
+    // protections
+    ballistic: 'Casque balistique',
+    reinforced: 'Combinaison renforcée',
+    riot_shield: 'Bouclier anti-émeute',
+    leather: 'Blouson en cuir',
+    tactical: 'Gilet tactique lourd',
+    bomb_suit: 'Combinaison de déminage',
+    vest: 'Gilet pare-balles',
+    helmet: 'Casque de moto',
+    juggernaut: 'Armure d’Iron Dude',
+    light_vest: 'Gilet léger en Kevlar',
+    // porte-bonheur
+    rosary: 'Chapelet de mamie',
+    gold_watch: 'Montre en or volée',
+    zippo: 'Zippo gravé',
+    rabbit_foot: 'Patte de lapin',
+    signet: 'Chevalière du Parrain',
+    loaded_dice: 'Dés pipés',
+    horseshoe: 'Fer à cheval doré',
+    clover: 'Trèfle à quatre feuilles',
+    gold_tooth: 'Dent en or du Capo',
+    santa_muerte: 'Médaille de la Santa Muerte',
+};
+
+/**
+ * Le nom à afficher pour un objet.
+ * @param item clé de l'objet (`knuckles`)
+ * @param name nom servi par le jeu, dans la langue du compte
+ * @param gameLocale langue du compte (`troops.gameLocale`)
+ */
+export function itemFr(item, name = null, gameLocale = null) {
+    // Le jeu répond déjà en français : son nom fait autorité, il est à jour par construction.
+    if (gameLocale && gameLocale.startsWith('fr') && name) return name;
+    return ITEM_FR[item] || name || item;
+}
+
 /** Un équipement normalisé, lisible et stable : c'est cette forme qui part en base et à l'écran. */
 export function readGear(raw) {
     return (raw || []).map((g) => ({
@@ -57,6 +116,8 @@ export function readGear(raw) {
         slotFr: FAMILIES[g.fam]?.fr || g.fam || null,
         item: g.item || null,
         name: g.name || g.item || null,
+        // Nom français : traduction maison tant que le compte joue en anglais (cf. ITEM_FR).
+        fr: ITEM_FR[g.item] || g.name || g.item || null,
         rarity: Number.isFinite(g.r) ? g.r : null,
         rarityFr: RARITIES[g.r]?.fr || g.rn || null,
         rarityName: g.rn || null,
@@ -109,7 +170,7 @@ export function gearSignature(gear) {
 export function gearLabel(g) {
     const bonus = Object.entries(g.affixes || {})
         .map(([k, v]) => `${v > 0 ? '+' : ''}${fmtNum(v)} ${AFFIXES[k]?.unit === 'pts' ? 'pts' : '%'} ${AFFIXES[k]?.fr.toLowerCase() || k}`);
-    return [g.name, g.rarityFr, ...bonus].filter(Boolean).join(' · ');
+    return [g.fr || ITEM_FR[g.item] || g.name, g.rarityFr, ...bonus].filter(Boolean).join(' · ');
 }
 
 /* ---------- Application à des stats de type ---------- */
@@ -180,6 +241,7 @@ export function buildItemCatalog(fights, { meId = null } = {}) {
                     const it = items.get(raw.item) || {
                         item: raw.item,
                         name: raw.name || raw.item,
+                        fr: ITEM_FR[raw.item] || raw.name || raw.item,
                         slot: raw.fam || null,
                         slotFr: FAMILIES[raw.fam]?.fr || raw.fam || null,
                         icon: raw.ico || null,
@@ -267,7 +329,7 @@ export function renderItemsDoc(catalog) {
             const rars = Object.values(i.rarities).sort((a, b) => (a.rarity ?? 9) - (b.rarity ?? 9))
                 .map((r) => `${r.fr} ×${r.seen}`).join(', ');
             const affixes = affixRanges(i);
-            out.push(`| **${esc(i.name)}** | \`${i.item}\` | ${i.seen} | ${i.seenMine || '—'} | ${rars || '—'} | ${affixes || '—'} |`);
+            out.push(`| **${esc(i.fr || i.name)}** | \`${i.item}\` | ${i.seen} | ${i.seenMine || '—'} | ${rars || '—'} | ${affixes || '—'} |`);
         }
         out.push('');
     }
